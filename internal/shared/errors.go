@@ -9,6 +9,7 @@ var (
 	ErrInvalidDefinition   = errors.New("invalid definition")
 	ErrAlreadyExists       = errors.New("already exists")
 	ErrNotFound            = errors.New("not found")
+	ErrTypeMismatch        = errors.New("type mismatch")
 	ErrConstraintViolation = errors.New("constraint violation")
 )
 

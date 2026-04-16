@@ -133,6 +133,17 @@ func TestCreateTableValidation(t *testing.T) {
 			},
 		},
 		{
+			name: "composite primary key unsupported",
+			def: shared.TableDefinition{
+				Name: "students",
+				Columns: []shared.ColumnDefinition{
+					{Name: "id", Type: shared.TypeInteger},
+					{Name: "dept_id", Type: shared.TypeInteger},
+				},
+				PrimaryKey: []string{"id", "dept_id"},
+			},
+		},
+		{
 			name: "missing foreign key source column",
 			def: shared.TableDefinition{
 				Name:        "students",
@@ -288,6 +299,46 @@ func TestGetTableAfterDrop(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestValidateRowValues confirms DML runtime rows align with schema arity and types.
+func TestValidateRowValues(t *testing.T) {
+	table := &TableMetadata{
+		Name: "students",
+		Columns: []shared.ColumnDefinition{
+			{Name: "id", Type: shared.TypeInteger},
+			{Name: "name", Type: shared.TypeString},
+		},
+	}
+
+	err := ValidateRowValues(table, []storage.Value{
+		storage.NewIntegerValue(1),
+		storage.NewStringValue("Ada"),
+	})
+	if err != nil {
+		t.Fatalf("expected valid row, got %v", err)
+	}
+
+	err = ValidateRowValues(table, []storage.Value{
+		storage.NewIntegerValue(1),
+	})
+	if err == nil {
+		t.Fatal("expected row-length error, got nil")
+	}
+	if !errors.Is(err, shared.ErrInvalidDefinition) {
+		t.Fatalf("expected invalid-definition error, got %v", err)
+	}
+
+	err = ValidateRowValues(table, []storage.Value{
+		storage.NewStringValue("wrong"), // should be integer
+		storage.NewStringValue("Ada"),
+	})
+	if err == nil {
+		t.Fatal("expected type-mismatch error, got nil")
+	}
+	if !errors.Is(err, shared.ErrTypeMismatch) {
+		t.Fatalf("expected type-mismatch error, got %v", err)
 	}
 }
 

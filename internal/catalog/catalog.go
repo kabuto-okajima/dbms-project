@@ -97,6 +97,15 @@ type IndexMetadata struct {
 	IndexBucket string
 }
 
+// ReferencingForeignKeyMetadata describes one child-table FK that points at a target table.
+// This is used for FK RESTRICT checks when deleting rows from the parent table.
+type ReferencingForeignKeyMetadata struct {
+	TableName  string
+	ColumnName string
+	RefTable   string
+	RefColumn  string
+}
+
 // Bootstrap ensures the internal catalog buckets exist.
 func (m *Manager) Bootstrap(tx *storage.Tx) error {
 	for _, bucketName := range []string{
@@ -200,7 +209,7 @@ func (m *Manager) CreateIndex(tx *storage.Tx, def shared.IndexDefinition) error 
 	if err != nil {
 		return err
 	}
-	columnOrdinal, err := tableColumnOrdinal(table, def.ColumnName)
+	columnOrdinal, err := ColumnOrdinal(table, def.ColumnName)
 	if err != nil {
 		return err
 	}
@@ -421,6 +430,33 @@ func (m *Manager) ListReferencingForeignKeys(tx *storage.Tx, tableName string) (
 	return foreignKeys, nil
 }
 
+// ListReferencingForeignKeyMetadata finds foreign keys in other tables that point at the target table, returning the child-table metadata needed for FK RESTRICT checks.
+func (m *Manager) ListReferencingForeignKeyMetadata(tx *storage.Tx, tableName string) ([]ReferencingForeignKeyMetadata, error) {
+	var foreignKeys []ReferencingForeignKeyMetadata
+
+	if err := tx.ForEach(ForeignKeysBucket, func(_ []byte, value []byte) error {
+		var record ForeignKeyRecord
+		if err := json.Unmarshal(value, &record); err != nil {
+			return err
+		}
+		if record.RefTable != tableName {
+			return nil
+		}
+
+		foreignKeys = append(foreignKeys, ReferencingForeignKeyMetadata{
+			TableName:  record.TableName,
+			ColumnName: record.ColumnName,
+			RefTable:   record.RefTable,
+			RefColumn:  record.RefColumn,
+		})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return foreignKeys, nil
+}
+
 // DropIndex removes index storage and catalog metadata for one index.
 func (m *Manager) DropIndex(tx *storage.Tx, indexName string) error {
 	if err := m.Bootstrap(tx); err != nil {
@@ -602,24 +638,9 @@ func (m *Manager) buildIndexEntries(tx *storage.Tx, table *TableMetadata, column
 	return entries, nil
 }
 
-// tableColumnOrdinal finds where a column sits inside the row layout
-func tableColumnOrdinal(table *TableMetadata, columnName string) (int, error) {
-	for i, column := range table.Columns {
-		if column.Name == columnName {
-			return i, nil
-		}
-	}
-	return 0, shared.NewError(shared.ErrNotFound, "column %q does not exist on table %q", columnName, table.Name)
-}
-
 func tableHasColumn(table *TableMetadata, columnName string) bool {
-	for _, column := range table.Columns {
-		if column.Name == columnName {
-			return true
-		}
-	}
-
-	return false
+	_, err := ColumnOrdinal(table, columnName)
+	return err == nil
 }
 
 func indexBucketName(indexName string) string {
@@ -700,6 +721,11 @@ func (m *Manager) validateCreateTableDefinition(tx *storage.Tx, def shared.Table
 		default:
 			return shared.NewError(shared.ErrInvalidDefinition, "create table: unsupported type %q for column %q", column.Type, column.Name)
 		}
+	}
+
+	// For simplicity, we only support single-column primary keys in v1.
+	if len(def.PrimaryKey) > 1 {
+		return shared.NewError(shared.ErrInvalidDefinition, "create table: composite primary keys are unsupported in v1")
 	}
 
 	for _, columnName := range def.PrimaryKey {
