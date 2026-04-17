@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"dbms-project/internal/shared"
+	"dbms-project/internal/statement"
 	"dbms-project/internal/storage"
 )
 
@@ -21,6 +22,7 @@ func TestRequestKinds(t *testing.T) {
 		{name: "insert", req: InsertRequest{}, want: StatementInsert},
 		{name: "delete", req: DeleteRequest{}, want: StatementDelete},
 		{name: "update", req: UpdateRequest{}, want: StatementUpdate},
+		{name: "select", req: SelectRequest{}, want: StatementSelect},
 	}
 
 	for _, tc := range tests {
@@ -66,6 +68,17 @@ func TestParseInsert(t *testing.T) {
 
 	if got := stmt.Kind(); got != StatementInsert {
 		t.Fatalf("expected insert kind, got %q", got)
+	}
+}
+
+func TestParseSelect(t *testing.T) {
+	stmt, err := Parse("select id from students")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stmt.Kind(); got != StatementSelect {
+		t.Fatalf("expected select kind, got %q", got)
 	}
 }
 
@@ -590,5 +603,93 @@ func TestBuildRequestUpdateRejectsMultipleAssignments(t *testing.T) {
 	}
 	if !errors.Is(err, shared.ErrInvalidDefinition) {
 		t.Fatalf("expected invalid-definition error, got %v", err)
+	}
+}
+
+func TestBuildRequestSelectAcceptsBasicShape(t *testing.T) {
+	raw, err := Parse("select id, name as student_name from students s where age = 20 order by name desc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectReq, ok := req.(SelectRequest)
+	if !ok {
+		t.Fatalf("expected SelectRequest, got %T", req)
+	}
+	if len(selectReq.Statement.SelectItems) != 2 || len(selectReq.Statement.From) != 1 || len(selectReq.Statement.OrderBy) != 1 {
+		t.Fatalf("unexpected select statement shape: %+v", selectReq.Statement)
+	}
+	if selectReq.Statement.SelectItems[1].Alias != "student_name" {
+		t.Fatalf("expected alias student_name, got %q", selectReq.Statement.SelectItems[1].Alias)
+	}
+	if selectReq.Statement.From[0] != (statement.TableRef{Name: "students", Alias: "s"}) {
+		t.Fatalf("unexpected from table: %+v", selectReq.Statement.From[0])
+	}
+	if _, ok := selectReq.Statement.Where.(statement.ComparisonExpr); !ok {
+		t.Fatalf("expected comparison WHERE expression, got %T", selectReq.Statement.Where)
+	}
+	if !selectReq.Statement.OrderBy[0].Desc {
+		t.Fatal("expected descending order-by term")
+	}
+}
+
+func TestBuildRequestSelectAcceptsAggregatesAndClauses(t *testing.T) {
+	raw, err := Parse("select dept_id, count(*) as total from students group by dept_id having count(*) > 1 order by dept_id asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectReq := req.(SelectRequest)
+	aggregate, ok := selectReq.Statement.SelectItems[1].Expr.(statement.AggregateExpr)
+	if !ok {
+		t.Fatalf("expected aggregate select item, got %T", selectReq.Statement.SelectItems[1].Expr)
+	}
+	if aggregate.Function != statement.AggCount {
+		t.Fatalf("expected COUNT aggregate, got %q", aggregate.Function)
+	}
+	if _, ok := aggregate.Arg.(statement.StarExpr); !ok {
+		t.Fatalf("expected COUNT(*) argument to be StarExpr, got %T", aggregate.Arg)
+	}
+
+	havingExpr, ok := selectReq.Statement.Having.(statement.ComparisonExpr)
+	if !ok {
+		t.Fatalf("expected comparison HAVING expression, got %T", selectReq.Statement.Having)
+	}
+	if havingExpr.Operator != statement.OpGreaterThan {
+		t.Fatalf("expected > HAVING operator, got %q", havingExpr.Operator)
+	}
+}
+
+func TestBuildRequestSelectAcceptsLogicalChains(t *testing.T) {
+	raw, err := Parse("select * from students where age = 20 and dept_id = 1 and id = 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectReq := req.(SelectRequest)
+	logicalExpr, ok := selectReq.Statement.Where.(statement.LogicalExpr)
+	if !ok {
+		t.Fatalf("expected logical WHERE expression, got %T", selectReq.Statement.Where)
+	}
+	if logicalExpr.Operator != statement.OpAnd {
+		t.Fatalf("expected AND logical operator, got %q", logicalExpr.Operator)
+	}
+	if len(logicalExpr.Terms) != 3 {
+		t.Fatalf("expected 3 logical terms, got %d", len(logicalExpr.Terms))
 	}
 }

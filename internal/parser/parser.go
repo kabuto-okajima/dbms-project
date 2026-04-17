@@ -109,6 +109,13 @@ type UpdateRequest struct {
 
 func (UpdateRequest) Kind() StatementKind { return StatementUpdate }
 
+// SelectRequest is the parser output for SELECT statements.
+type SelectRequest struct {
+	Statement statement.SelectStatement
+}
+
+func (SelectRequest) Kind() StatementKind { return StatementSelect }
+
 // ParseRequest is the future main parser entrypoint for the app layer. For now
 // it reserves the contract boundary and routes through raw parsing.
 func ParseRequest(sql string) (Request, error) {
@@ -170,6 +177,12 @@ func BuildRequest(raw *RawStatement) (Request, error) {
 			return nil, fmt.Errorf("parser: expected update AST, got %T", raw.ast)
 		}
 		return buildUpdateRequest(stmt)
+	case StatementSelect:
+		stmt, ok := raw.ast.(*sqlparser.Select)
+		if !ok {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: only plain SELECT is supported")
+		}
+		return buildSelectRequest(stmt)
 	default:
 		return nil, fmt.Errorf("parser: %s request conversion not implemented yet", raw.Kind())
 	}
@@ -469,6 +482,72 @@ func buildUpdateRequest(stmt *sqlparser.Update) (Request, error) {
 	}, nil
 }
 
+// buildSelectRequest converts a plain SELECT statement into the project's
+// parser-owned SELECT shape for later binder work.
+func buildSelectRequest(stmt *sqlparser.Select) (Request, error) {
+	if stmt == nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: statement is required")
+	}
+	if stmt.With != nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: WITH is unsupported")
+	}
+	if stmt.Distinct {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: DISTINCT is unsupported")
+	}
+	if stmt.HighPriority || stmt.StraightJoinHint || stmt.SQLSmallResult || stmt.SQLBigResult || stmt.SQLBufferResult || stmt.SQLCalcFoundRows {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: SELECT modifiers are unsupported")
+	}
+	if stmt.Windows != nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: window functions are unsupported")
+	}
+	if stmt.Limit != nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: LIMIT is unsupported")
+	}
+	if stmt.Lock != sqlparser.NoLock {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: locking clauses are unsupported")
+	}
+	if stmt.Into != nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: INTO is unsupported")
+	}
+
+	// e.g., selectItems is like the "id, name" part of "SELECT id, name FROM t", and stmt.From is like the "t" part.
+	selectItems, err := buildSelectItems(stmt.SelectExprs)
+	if err != nil {
+		return nil, err
+	}
+	from, err := buildSelectTableRefs(stmt.From)
+	if err != nil {
+		return nil, err
+	}
+	where, err := buildOptionalExpression(stmt.Where)
+	if err != nil {
+		return nil, err
+	}
+	groupBy, err := buildGroupByExpressions(stmt.GroupBy)
+	if err != nil {
+		return nil, err
+	}
+	having, err := buildOptionalExpression(stmt.Having)
+	if err != nil {
+		return nil, err
+	}
+	orderBy, err := buildOrderByTerms(stmt.OrderBy)
+	if err != nil {
+		return nil, err
+	}
+
+	return SelectRequest{
+		Statement: statement.SelectStatement{
+			SelectItems: selectItems,
+			From:        from,
+			Where:       where,
+			GroupBy:     groupBy,
+			Having:      having,
+			OrderBy:     orderBy,
+		},
+	}, nil
+}
+
 func buildCreateTableColumns(columns []*sqlparser.ColumnDefinition) ([]shared.ColumnDefinition, []string, []shared.ForeignKeyDefinition, error) {
 	defs := make([]shared.ColumnDefinition, 0, len(columns))
 	var primaryKey []string
@@ -667,6 +746,313 @@ func buildForeignKeyReference(sourceColumns []string, ref *sqlparser.ReferenceDe
 		ColumnName: sourceColumns[0],
 		RefTable:   ref.ReferencedTable.Name.String(),
 		RefColumn:  ref.ReferencedColumns[0].String(),
+	}, nil
+}
+
+func buildSelectItems(selectExprs *sqlparser.SelectExprs) ([]statement.SelectItem, error) {
+	if selectExprs == nil || len(selectExprs.Exprs) == 0 {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: at least one select item is required")
+	}
+
+	items := make([]statement.SelectItem, 0, len(selectExprs.Exprs))
+	for _, selectExpr := range selectExprs.Exprs {
+		switch expr := selectExpr.(type) {
+		case *sqlparser.StarExpr:
+			if expr.TableName.Name.String() != "" || expr.TableName.Qualifier.String() != "" {
+				return nil, shared.NewError(shared.ErrInvalidDefinition, "select: qualified star expressions are unsupported")
+			}
+			items = append(items, statement.SelectItem{
+				Expr: statement.StarExpr{},
+			})
+		case *sqlparser.AliasedExpr:
+			builtExpr, err := buildSelectExpression(expr.Expr)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, statement.SelectItem{
+				Expr:  builtExpr,
+				Alias: expr.As.String(),
+			})
+		default:
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported select item")
+		}
+	}
+
+	return items, nil
+}
+
+func buildSelectTableRefs(exprs []sqlparser.TableExpr) ([]statement.TableRef, error) {
+	if len(exprs) == 0 {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: FROM is required")
+	}
+
+	refs := make([]statement.TableRef, 0, len(exprs))
+	for _, expr := range exprs {
+		aliasedExpr, ok := expr.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported table expression")
+		}
+		if len(aliasedExpr.Partitions) > 0 {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: partition selection is unsupported")
+		}
+		if len(aliasedExpr.Hints) > 0 {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: index hints are unsupported")
+		}
+		if len(aliasedExpr.Columns) > 0 {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: derived column aliases are unsupported")
+		}
+
+		tableName, err := extractSimpleTableName(aliasedExpr.Expr)
+		if err != nil {
+			return nil, err
+		}
+
+		refs = append(refs, statement.TableRef{
+			Name:  tableName,
+			Alias: aliasedExpr.As.String(),
+		})
+	}
+
+	return refs, nil
+}
+
+func buildOptionalExpression(where *sqlparser.Where) (statement.Expression, error) {
+	if where == nil {
+		return nil, nil
+	}
+
+	return buildSelectExpression(where.Expr)
+}
+
+func buildGroupByExpressions(groupBy *sqlparser.GroupBy) ([]statement.Expression, error) {
+	if groupBy == nil || len(groupBy.Exprs) == 0 {
+		return nil, nil
+	}
+	if groupBy.WithRollup {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: GROUP BY WITH ROLLUP is unsupported")
+	}
+
+	exprs := make([]statement.Expression, 0, len(groupBy.Exprs))
+	for _, expr := range groupBy.Exprs {
+		builtExpr, err := buildSelectExpression(expr)
+		if err != nil {
+			return nil, err
+		}
+		exprs = append(exprs, builtExpr)
+	}
+
+	return exprs, nil
+}
+
+func buildOrderByTerms(orderBy sqlparser.OrderBy) ([]statement.OrderByTerm, error) {
+	if len(orderBy) == 0 {
+		return nil, nil
+	}
+
+	terms := make([]statement.OrderByTerm, 0, len(orderBy))
+	for _, order := range orderBy {
+		if order == nil {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: ORDER BY item is required")
+		}
+
+		builtExpr, err := buildSelectExpression(order.Expr)
+		if err != nil {
+			return nil, err
+		}
+
+		desc := false
+		switch order.Direction {
+		case sqlparser.AscOrder:
+			desc = false
+		case sqlparser.DescOrder:
+			desc = true
+		default:
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported ORDER BY direction")
+		}
+
+		terms = append(terms, statement.OrderByTerm{
+			Expr: builtExpr,
+			Desc: desc,
+		})
+	}
+
+	return terms, nil
+}
+
+func buildSelectExpression(expr sqlparser.Expr) (statement.Expression, error) {
+	switch valueExpr := expr.(type) {
+	case *sqlparser.ColName:
+		if valueExpr.Name.String() == "" {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: column name is required")
+		}
+		if valueExpr.Qualifier.Qualifier.String() != "" {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: qualified table names are unsupported")
+		}
+
+		return statement.ColumnRef{
+			TableName:  valueExpr.Qualifier.Name.String(),
+			ColumnName: valueExpr.Name.String(),
+		}, nil
+	case *sqlparser.Literal:
+		value, err := buildLiteralValue(valueExpr)
+		if err != nil {
+			return nil, err
+		}
+		return statement.LiteralExpr{Value: value}, nil
+	case *sqlparser.NullVal:
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: NULL expressions are unsupported")
+	case *sqlparser.ComparisonExpr:
+		if valueExpr.Modifier != sqlparser.Missing {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: comparison modifiers are unsupported")
+		}
+		if valueExpr.Escape != nil {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: comparison ESCAPE clauses are unsupported")
+		}
+
+		left, err := buildSelectExpression(valueExpr.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := buildSelectExpression(valueExpr.Right)
+		if err != nil {
+			return nil, err
+		}
+
+		operator, err := mapComparisonOperator(valueExpr.Operator)
+		if err != nil {
+			return nil, err
+		}
+
+		return statement.ComparisonExpr{
+			Left:     left,
+			Operator: operator,
+			Right:    right,
+		}, nil
+	case *sqlparser.AndExpr:
+		return buildLogicalExpression(statement.OpAnd, valueExpr.Left, valueExpr.Right)
+	case *sqlparser.OrExpr:
+		return buildLogicalExpression(statement.OpOr, valueExpr.Left, valueExpr.Right)
+	case *sqlparser.CountStar:
+		return statement.AggregateExpr{
+			Function: statement.AggCount,
+			Arg:      statement.StarExpr{},
+		}, nil
+	case *sqlparser.Count:
+		return buildCountAggregateExpression(valueExpr)
+	case *sqlparser.Sum:
+		return buildUnaryAggregateExpression(statement.AggSum, valueExpr.Arg, valueExpr.Distinct, valueExpr.OverClause != nil)
+	case *sqlparser.Min:
+		return buildUnaryAggregateExpression(statement.AggMin, valueExpr.Arg, valueExpr.Distinct, valueExpr.OverClause != nil)
+	case *sqlparser.Max:
+		return buildUnaryAggregateExpression(statement.AggMax, valueExpr.Arg, valueExpr.Distinct, valueExpr.OverClause != nil)
+	default:
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported expression %T", expr)
+	}
+}
+
+func buildLogicalExpression(operator statement.LogicalOperator, leftExpr, rightExpr sqlparser.Expr) (statement.Expression, error) {
+	terms := make([]statement.Expression, 0, 3)
+	if err := flattenLogicalTerms(operator, leftExpr, &terms); err != nil {
+		return nil, err
+	}
+	if err := flattenLogicalTerms(operator, rightExpr, &terms); err != nil {
+		return nil, err
+	}
+
+	return statement.LogicalExpr{
+		Operator: operator,
+		Terms:    terms,
+	}, nil
+}
+
+func flattenLogicalTerms(operator statement.LogicalOperator, expr sqlparser.Expr, terms *[]statement.Expression) error {
+	switch logicalExpr := expr.(type) {
+	case *sqlparser.AndExpr:
+		if operator != statement.OpAnd {
+			return shared.NewError(shared.ErrInvalidDefinition, "select: mixed AND/OR expressions are unsupported")
+		}
+		if err := flattenLogicalTerms(operator, logicalExpr.Left, terms); err != nil {
+			return err
+		}
+		return flattenLogicalTerms(operator, logicalExpr.Right, terms)
+	case *sqlparser.OrExpr:
+		if operator != statement.OpOr {
+			return shared.NewError(shared.ErrInvalidDefinition, "select: mixed AND/OR expressions are unsupported")
+		}
+		if err := flattenLogicalTerms(operator, logicalExpr.Left, terms); err != nil {
+			return err
+		}
+		return flattenLogicalTerms(operator, logicalExpr.Right, terms)
+	default:
+		builtExpr, err := buildSelectExpression(expr)
+		if err != nil {
+			return err
+		}
+		*terms = append(*terms, builtExpr)
+		return nil
+	}
+}
+
+func buildCountAggregateExpression(expr *sqlparser.Count) (statement.Expression, error) {
+	if expr == nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: COUNT expression is required")
+	}
+	if expr.OverClause != nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: windowed aggregates are unsupported")
+	}
+	if len(expr.Args) != 1 {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: COUNT requires exactly one argument")
+	}
+
+	arg, err := buildSelectExpression(expr.Args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return statement.AggregateExpr{
+		Function: statement.AggCount,
+		Arg:      arg,
+		Distinct: expr.Distinct,
+	}, nil
+}
+
+func mapComparisonOperator(operator sqlparser.ComparisonExprOperator) (statement.ComparisonOperator, error) {
+	switch operator {
+	case sqlparser.EqualOp:
+		return statement.OpEqual, nil
+	case sqlparser.NotEqualOp:
+		return statement.OpNotEqual, nil
+	case sqlparser.LessThanOp:
+		return statement.OpLessThan, nil
+	case sqlparser.LessEqualOp:
+		return statement.OpLessThanOrEqual, nil
+	case sqlparser.GreaterThanOp:
+		return statement.OpGreaterThan, nil
+	case sqlparser.GreaterEqualOp:
+		return statement.OpGreaterThanOrEqual, nil
+	default:
+		return "", shared.NewError(shared.ErrInvalidDefinition, "select: unsupported comparison operator %q", operator.ToString())
+	}
+}
+
+func buildUnaryAggregateExpression(function statement.AggregateFunction, arg sqlparser.Expr, distinct bool, hasOverClause bool) (statement.Expression, error) {
+	if hasOverClause {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: windowed aggregates are unsupported")
+	}
+
+	builtArg, err := buildSelectExpression(arg)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, ok := builtArg.(statement.StarExpr); ok {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: only COUNT supports *")
+	}
+
+	return statement.AggregateExpr{
+		Function: function,
+		Arg:      builtArg,
+		Distinct: distinct,
 	}, nil
 }
 
