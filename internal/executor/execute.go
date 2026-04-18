@@ -1,8 +1,8 @@
 package executor
 
 import (
-	"dbms-project/internal/catalog"
 	"dbms-project/internal/binder"
+	"dbms-project/internal/catalog"
 	"dbms-project/internal/planner"
 	"dbms-project/internal/shared"
 	"dbms-project/internal/statement"
@@ -81,6 +81,8 @@ func executePhysicalPlan(tx *storage.Tx, plan PhysicalPlan) (RuntimeResult, erro
 	case PhysicalTableScan:
 		return node.Execute(tx)
 	case PhysicalIndexScan:
+		return node.Execute(tx)
+	case PhysicalNestedLoopJoin:
 		return node.Execute(tx)
 	case PhysicalFilter:
 		return node.Execute(tx)
@@ -383,6 +385,55 @@ func (scan PhysicalIndexScan) Execute(tx *storage.Tx) (RuntimeResult, error) {
 			}
 		}
 		result.Rows = append(result.Rows, runtimeRow)
+	}
+
+	return result, nil
+}
+
+// Execute materializes both inputs and performs a nested-loop equi-join.
+func (join PhysicalNestedLoopJoin) Execute(tx *storage.Tx) (RuntimeResult, error) {
+	if tx == nil {
+		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: transaction is required")
+	}
+	if join.Predicate == nil {
+		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: join predicate is required")
+	}
+
+	// join.Left: LogicalScan{Table: t},
+	// join.Right: LogicalScan{Table: u}
+	left, err := executePhysicalPlan(tx, join.Left)
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+	right, err := executePhysicalPlan(tx, join.Right)
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+
+	result := RuntimeResult{
+		Schema: make(RuntimeSchema, 0, len(left.Schema)+len(right.Schema)),
+		Rows:   make([]RuntimeRow, 0),
+	}
+	result.Schema = append(result.Schema, left.Schema...)
+	result.Schema = append(result.Schema, right.Schema...)
+
+	for _, leftRow := range left.Rows {
+		for _, rightRow := range right.Rows {
+			joinedValues := make(storage.Row, 0, len(leftRow.Values)+len(rightRow.Values))
+			joinedValues = append(joinedValues, leftRow.Values...)
+			joinedValues = append(joinedValues, rightRow.Values...)
+
+			joinedRow := RuntimeRow{Values: joinedValues}
+			ok, err := EvaluatePredicate(join.Predicate, joinedRow)
+			if err != nil {
+				return RuntimeResult{}, err
+			}
+			if !ok {
+				continue
+			}
+
+			result.Rows = append(result.Rows, joinedRow)
+		}
 	}
 
 	return result, nil

@@ -232,6 +232,99 @@ func TestBindSelectResolvesAliasesInHavingAndOrderBy(t *testing.T) {
 	}
 }
 
+func TestBindSelectResolvesTwoTableJoinColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		return manager.CreateTable(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		bound, err := New(manager).BindSelect(tx, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{TableName: "s", ColumnName: "name"}, Alias: "student_name"},
+				{Expr: statement.ColumnRef{TableName: "d", ColumnName: "name"}, Alias: "department_name"},
+			},
+			From: []statement.TableRef{
+				{Name: "students", Alias: "s"},
+				{Name: "departments", Alias: "d"},
+			},
+			Join: &statement.JoinClause{
+				Type: statement.JoinInner,
+				On: statement.ComparisonExpr{
+					Left:     statement.ColumnRef{TableName: "s", ColumnName: "dept_id"},
+					Operator: statement.OpEqual,
+					Right:    statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				},
+			},
+			Where: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				Operator: statement.OpGreaterThan,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(10)},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(bound.From) != 2 || bound.Join == nil {
+			t.Fatalf("unexpected bound two-table shape: %+v", bound)
+		}
+
+		leftSelect := bound.SelectItems[0].Expr.(BoundColumnRef)
+		rightSelect := bound.SelectItems[1].Expr.(BoundColumnRef)
+		if leftSelect.TableName != "students" || leftSelect.ColumnName != "name" || leftSelect.Ordinal != 2 {
+			t.Fatalf("unexpected left selected column: %+v", leftSelect)
+		}
+		if rightSelect.TableName != "departments" || rightSelect.ColumnName != "name" || rightSelect.Ordinal != 4 {
+			t.Fatalf("unexpected right selected column: %+v", rightSelect)
+		}
+
+		onExpr, ok := bound.Join.On.(BoundComparisonExpr)
+		if !ok {
+			t.Fatalf("expected bound ON comparison, got %T", bound.Join.On)
+		}
+		leftOn := onExpr.Left.(BoundColumnRef)
+		rightOn := onExpr.Right.(BoundColumnRef)
+		if leftOn.Ordinal != 1 || rightOn.Ordinal != 3 {
+			t.Fatalf("unexpected ON ordinals: left=%+v right=%+v", leftOn, rightOn)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBindSelectRejectsTypeMismatch(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 
@@ -492,6 +585,153 @@ func TestBindSelectRejectsResolutionErrors(t *testing.T) {
 			})
 			if err == nil {
 				t.Fatal("expected duplicate-alias error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("ambiguous two-table column", func(t *testing.T) {
+		err := store.View(func(tx *storage.Tx) error {
+			_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+				SelectItems: []statement.SelectItem{
+					{Expr: statement.ColumnRef{ColumnName: "id"}},
+				},
+				From: []statement.TableRef{
+					{Name: "students", Alias: "s"},
+					{Name: "departments", Alias: "d"},
+				},
+				Join: &statement.JoinClause{
+					Type: statement.JoinInner,
+					On: statement.ComparisonExpr{
+						Left:     statement.ColumnRef{TableName: "s", ColumnName: "id"},
+						Operator: statement.OpEqual,
+						Right:    statement.ColumnRef{TableName: "d", ColumnName: "id"},
+					},
+				},
+			})
+			if err == nil {
+				t.Fatal("expected ambiguous-column error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("join requires on predicate", func(t *testing.T) {
+		err := store.View(func(tx *storage.Tx) error {
+			_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+				SelectItems: []statement.SelectItem{{Expr: statement.StarExpr{}}},
+				From: []statement.TableRef{
+					{Name: "students", Alias: "s"},
+					{Name: "departments", Alias: "d"},
+				},
+				Join: &statement.JoinClause{
+					Type: statement.JoinInner,
+				},
+			})
+			if err == nil {
+				t.Fatal("expected missing-join-predicate error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("join requires equality predicate", func(t *testing.T) {
+		err := store.View(func(tx *storage.Tx) error {
+			_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+				SelectItems: []statement.SelectItem{{Expr: statement.StarExpr{}}},
+				From: []statement.TableRef{
+					{Name: "students", Alias: "s"},
+					{Name: "departments", Alias: "d"},
+				},
+				Join: &statement.JoinClause{
+					Type: statement.JoinInner,
+					On: statement.ComparisonExpr{
+						Left:     statement.ColumnRef{TableName: "s", ColumnName: "id"},
+						Operator: statement.OpGreaterThan,
+						Right:    statement.ColumnRef{TableName: "d", ColumnName: "id"},
+					},
+				},
+			})
+			if err == nil {
+				t.Fatal("expected non-equi-join error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("join keys must be column refs", func(t *testing.T) {
+		err := store.View(func(tx *storage.Tx) error {
+			_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+				SelectItems: []statement.SelectItem{{Expr: statement.StarExpr{}}},
+				From: []statement.TableRef{
+					{Name: "students", Alias: "s"},
+					{Name: "departments", Alias: "d"},
+				},
+				Join: &statement.JoinClause{
+					Type: statement.JoinInner,
+					On: statement.ComparisonExpr{
+						Left:     statement.ColumnRef{TableName: "s", ColumnName: "id"},
+						Operator: statement.OpEqual,
+						Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+					},
+				},
+			})
+			if err == nil {
+				t.Fatal("expected non-column-join-key error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("join keys must come from different tables", func(t *testing.T) {
+		err := store.View(func(tx *storage.Tx) error {
+			_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+				SelectItems: []statement.SelectItem{{Expr: statement.StarExpr{}}},
+				From: []statement.TableRef{
+					{Name: "students", Alias: "s"},
+					{Name: "departments", Alias: "d"},
+				},
+				Join: &statement.JoinClause{
+					Type: statement.JoinInner,
+					On: statement.ComparisonExpr{
+						Left:     statement.ColumnRef{TableName: "s", ColumnName: "id"},
+						Operator: statement.OpEqual,
+						Right:    statement.ColumnRef{TableName: "s", ColumnName: "id"},
+					},
+				},
+			})
+			if err == nil {
+				t.Fatal("expected same-table-join-key error, got nil")
 			}
 			if !errors.Is(err, shared.ErrInvalidDefinition) {
 				t.Fatalf("expected invalid-definition error, got %v", err)

@@ -10,6 +10,7 @@ import "dbms-project/internal/storage"
 type SelectStatement struct {
 	SelectItems []SelectItem
 	From        []TableRef
+	Join        *JoinClause
 	Where       Expression
 	GroupBy     []Expression
 	Having      Expression
@@ -27,6 +28,22 @@ type SelectItem struct {
 type TableRef struct {
 	Name  string
 	Alias string
+}
+
+// JoinType identifies one supported join family.
+type JoinType string
+
+const (
+	JoinInner JoinType = "INNER"
+)
+
+// JoinClause represents one explicit JOIN attached to the FROM clause.
+//
+// In the first JOIN step we support exactly one inner join between two base
+// tables, with the left and right tables still stored in SelectStatement.From.
+type JoinClause struct {
+	Type JoinType
+	On   Expression
 }
 
 // OrderByTerm represents one ORDER BY item.

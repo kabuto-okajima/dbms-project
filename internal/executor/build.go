@@ -28,6 +28,20 @@ func buildPhysicalPlan(tx *storage.Tx, plan planner.LogicalPlan) (PhysicalPlan, 
 		return PhysicalTableScan{
 			Table: node.Table,
 		}, nil
+	case planner.LogicalJoin:
+		left, err := buildPhysicalPlan(tx, node.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := buildPhysicalPlan(tx, node.Right)
+		if err != nil {
+			return nil, err
+		}
+		return PhysicalNestedLoopJoin{
+			Left:      left,
+			Right:     right,
+			Predicate: node.Predicate,
+		}, nil
 	case planner.LogicalFilter:
 		// If index-based scanning is possible, use it instead of a filter over a table scan.
 		indexScan, ok, err := tryBuildIndexScan(tx, node)

@@ -823,6 +823,127 @@ func TestPhysicalFilterExecuteReturnsEmptyRowsWhenNothingMatches(t *testing.T) {
 	}
 }
 
+func TestPhysicalNestedLoopJoinExecuteMatchesEquiJoin(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+
+		insertExec := statement.NewInsertExecutor(manager)
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewIntegerValue(10), storage.NewStringValue("Alice")},
+			{storage.NewIntegerValue(2), storage.NewIntegerValue(20), storage.NewStringValue("Bob")},
+			{storage.NewIntegerValue(3), storage.NewIntegerValue(10), storage.NewStringValue("Carol")},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(10), storage.NewStringValue("CS")},
+			{storage.NewIntegerValue(30), storage.NewStringValue("Math")},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "departments",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		students, err := manager.GetTable(tx, "students")
+		if err != nil {
+			return err
+		}
+		departments, err := manager.GetTable(tx, "departments")
+		if err != nil {
+			return err
+		}
+
+		result, err := ExecutePlan(tx, PhysicalNestedLoopJoin{
+			Left: PhysicalTableScan{
+				Table: binder.BoundTable{Name: "students", Metadata: students},
+			},
+			Right: PhysicalTableScan{
+				Table: binder.BoundTable{Name: "departments", Metadata: departments},
+			},
+			Predicate: binder.BoundComparisonExpr{
+				Left: binder.BoundColumnRef{
+					TableName:  "students",
+					ColumnName: "dept_id",
+					Ordinal:    1,
+					Type:       shared.TypeInteger,
+				},
+				Operator: statement.OpEqual,
+				Right: binder.BoundColumnRef{
+					TableName:  "departments",
+					ColumnName: "id",
+					Ordinal:    3,
+					Type:       shared.TypeInteger,
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(result.Schema) != 5 {
+			t.Fatalf("expected 5 joined schema columns, got %+v", result.Schema)
+		}
+		if len(result.Rows) != 2 {
+			t.Fatalf("expected 2 joined rows, got %+v", result.Rows)
+		}
+		if result.Rows[0].Values[2] != storage.NewStringValue("Alice") || result.Rows[0].Values[4] != storage.NewStringValue("CS") {
+			t.Fatalf("unexpected first joined row: %+v", result.Rows[0].Values)
+		}
+		if result.Rows[1].Values[2] != storage.NewStringValue("Carol") || result.Rows[1].Values[4] != storage.NewStringValue("CS") {
+			t.Fatalf("unexpected second joined row: %+v", result.Rows[1].Values)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPhysicalProjectExecuteShapesFilteredOutput(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 
@@ -2564,6 +2685,124 @@ func TestExecuteSelectRunsGroupedHavingPipeline(t *testing.T) {
 		}
 		if result.Rows[0].Values[0] != storage.NewIntegerValue(10) || result.Rows[0].Values[1] != storage.NewIntegerValue(2) {
 			t.Fatalf("unexpected grouped ExecuteSelect row: %+v", result.Rows[0])
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecuteSelectRunsJoinPipeline(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+
+		insertExec := statement.NewInsertExecutor(manager)
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewIntegerValue(10), storage.NewStringValue("Alice")},
+			{storage.NewIntegerValue(2), storage.NewIntegerValue(20), storage.NewStringValue("Bob")},
+			{storage.NewIntegerValue(3), storage.NewIntegerValue(10), storage.NewStringValue("Carol")},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(10), storage.NewStringValue("CS")},
+			{storage.NewIntegerValue(20), storage.NewStringValue("Physics")},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "departments",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		result, err := ExecuteSelect(tx, manager, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{TableName: "s", ColumnName: "name"}, Alias: "student_name"},
+				{Expr: statement.ColumnRef{TableName: "d", ColumnName: "name"}, Alias: "department_name"},
+			},
+			From: []statement.TableRef{
+				{Name: "students", Alias: "s"},
+				{Name: "departments", Alias: "d"},
+			},
+			Join: &statement.JoinClause{
+				Type: statement.JoinInner,
+				On: statement.ComparisonExpr{
+					Left:     statement.ColumnRef{TableName: "s", ColumnName: "dept_id"},
+					Operator: statement.OpEqual,
+					Right:    statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				},
+			},
+			Where: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				Operator: statement.OpEqual,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(10)},
+			},
+			OrderBy: []statement.OrderByTerm{
+				{Expr: statement.ColumnRef{TableName: "s", ColumnName: "name"}},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(result.Schema) != 2 {
+			t.Fatalf("unexpected join schema: %+v", result.Schema)
+		}
+		if result.Schema[0].Name != "student_name" || result.Schema[1].Name != "department_name" {
+			t.Fatalf("unexpected join schema names: %+v", result.Schema)
+		}
+		if len(result.Rows) != 2 {
+			t.Fatalf("expected 2 join rows, got %+v", result.Rows)
+		}
+		if result.Rows[0].Values[0] != storage.NewStringValue("Alice") || result.Rows[0].Values[1] != storage.NewStringValue("CS") {
+			t.Fatalf("unexpected first join row: %+v", result.Rows[0].Values)
+		}
+		if result.Rows[1].Values[0] != storage.NewStringValue("Carol") || result.Rows[1].Values[1] != storage.NewStringValue("CS") {
+			t.Fatalf("unexpected second join row: %+v", result.Rows[1].Values)
 		}
 
 		return nil

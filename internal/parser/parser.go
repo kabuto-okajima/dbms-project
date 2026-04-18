@@ -515,7 +515,7 @@ func buildSelectRequest(stmt *sqlparser.Select) (Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	from, err := buildSelectTableRefs(stmt.From)
+	from, join, err := buildSelectTableRefs(stmt.From)
 	if err != nil {
 		return nil, err
 	}
@@ -540,6 +540,7 @@ func buildSelectRequest(stmt *sqlparser.Select) (Request, error) {
 		Statement: statement.SelectStatement{
 			SelectItems: selectItems,
 			From:        from,
+			Join:        join,
 			Where:       where,
 			GroupBy:     groupBy,
 			Having:      having,
@@ -781,39 +782,90 @@ func buildSelectItems(selectExprs *sqlparser.SelectExprs) ([]statement.SelectIte
 	return items, nil
 }
 
-func buildSelectTableRefs(exprs []sqlparser.TableExpr) ([]statement.TableRef, error) {
+func buildSelectTableRefs(exprs []sqlparser.TableExpr) ([]statement.TableRef, *statement.JoinClause, error) {
 	if len(exprs) == 0 {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "select: FROM is required")
+		return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: FROM is required")
+	}
+	if len(exprs) != 1 {
+		return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: multiple FROM items are unsupported")
 	}
 
-	refs := make([]statement.TableRef, 0, len(exprs))
-	for _, expr := range exprs {
-		aliasedExpr, ok := expr.(*sqlparser.AliasedTableExpr)
-		if !ok {
-			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported table expression")
-		}
-		if len(aliasedExpr.Partitions) > 0 {
-			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: partition selection is unsupported")
-		}
-		if len(aliasedExpr.Hints) > 0 {
-			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: index hints are unsupported")
-		}
-		if len(aliasedExpr.Columns) > 0 {
-			return nil, shared.NewError(shared.ErrInvalidDefinition, "select: derived column aliases are unsupported")
-		}
-
-		tableName, err := extractSimpleTableName(aliasedExpr.Expr)
+	switch expr := exprs[0].(type) {
+	case *sqlparser.AliasedTableExpr:
+		ref, err := buildSelectTableRef(expr)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		return []statement.TableRef{ref}, nil, nil
+	case *sqlparser.JoinTableExpr:
+		if expr.Join != sqlparser.NormalJoinType {
+			return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: only INNER JOIN is supported in this step")
+		}
+		if expr.Condition == nil || expr.Condition.On == nil {
+			return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: JOIN requires an ON predicate in this step")
+		}
+		if len(expr.Condition.Using) > 0 {
+			return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: JOIN USING is unsupported")
 		}
 
-		refs = append(refs, statement.TableRef{
-			Name:  tableName,
-			Alias: aliasedExpr.As.String(),
-		})
+		// e.g., in "SELECT ... FROM t1 JOIN t2 ON t1.id = t2.id",
+		// the JoinTableExpr is like the "t1 JOIN t2 ON t1.id = t2.id" part,
+		// the leftExpr is like the "t1" part, and the rightExpr is like the "t2" part.
+		leftExpr, ok := expr.LeftExpr.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported left join table expression")
+		}
+		rightExpr, ok := expr.RightExpr.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported right join table expression")
+		}
+
+		leftRef, err := buildSelectTableRef(leftExpr)
+		if err != nil {
+			return nil, nil, err
+		}
+		rightRef, err := buildSelectTableRef(rightExpr)
+		if err != nil {
+			return nil, nil, err
+		}
+		// "t1.id = t2.id" part of "SELECT ... FROM t1 JOIN t2 ON t1.id = t2.id"
+		onExpr, err := buildSelectExpression(expr.Condition.On)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return []statement.TableRef{leftRef, rightRef}, &statement.JoinClause{
+			Type: statement.JoinInner,
+			On:   onExpr,
+		}, nil
+	default:
+		return nil, nil, shared.NewError(shared.ErrInvalidDefinition, "select: unsupported table expression")
+	}
+}
+
+func buildSelectTableRef(aliasedExpr *sqlparser.AliasedTableExpr) (statement.TableRef, error) {
+	if aliasedExpr == nil {
+		return statement.TableRef{}, shared.NewError(shared.ErrInvalidDefinition, "select: table expression is required")
+	}
+	if len(aliasedExpr.Partitions) > 0 {
+		return statement.TableRef{}, shared.NewError(shared.ErrInvalidDefinition, "select: partition selection is unsupported")
+	}
+	if len(aliasedExpr.Hints) > 0 {
+		return statement.TableRef{}, shared.NewError(shared.ErrInvalidDefinition, "select: index hints are unsupported")
+	}
+	if len(aliasedExpr.Columns) > 0 {
+		return statement.TableRef{}, shared.NewError(shared.ErrInvalidDefinition, "select: derived column aliases are unsupported")
 	}
 
-	return refs, nil
+	tableName, err := extractSimpleTableName(aliasedExpr.Expr)
+	if err != nil {
+		return statement.TableRef{}, err
+	}
+
+	return statement.TableRef{
+		Name:  tableName,
+		Alias: aliasedExpr.As.String(),
+	}, nil
 }
 
 func buildOptionalExpression(where *sqlparser.Where) (statement.Expression, error) {

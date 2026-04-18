@@ -34,6 +34,23 @@ type LogicalFilter struct {
 
 func (LogicalFilter) isLogicalPlan() {}
 
+// LogicalJoin combines two input plans using one join predicate.
+//
+// example:
+//   - SELECT * FROM s JOIN d ON s.dept_id = d.id
+//   - LogicalJoin{
+//     Left: LogicalScan{Table: s},
+//     Right: LogicalScan{Table: d},
+//     Predicate: s.dept_id = d.id,
+//     }
+type LogicalJoin struct {
+	Left      LogicalPlan
+	Right     LogicalPlan
+	Predicate binder.BoundExpression
+}
+
+func (LogicalJoin) isLogicalPlan() {}
+
 // LogicalAggregate groups rows and computes aggregate values.
 //
 // example:

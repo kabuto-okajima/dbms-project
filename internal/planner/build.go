@@ -17,18 +17,25 @@ import (
 //				└─ Filter(HAVING)
 //						└─ Aggregate
 //								└─ Filter(WHERE)
-//										└─ Scan
+//										└─ Join or Scan
 func BuildLogicalSelect(bound *binder.BoundSelect) (LogicalPlan, error) {
 	if bound == nil {
 		return nil, shared.NewError(shared.ErrInvalidDefinition, "planner: bound select is required")
 	}
-	if len(bound.From) != 1 {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "planner: exactly one FROM table is required")
+	plan, err := buildLogicalFromPlan(bound)
+	if err != nil {
+		return nil, err
 	}
-
-	var plan LogicalPlan = LogicalScan{
-		Table: bound.From[0],
-	}
+	// examples:
+	//  - SELECT * FROM t
+	//  - LogicalScan{Table: t}
+	//
+	//   - SELECT * FROM t JOIN u ON t.a = u.a
+	//   - LogicalJoin{
+	//       Left: LogicalScan{Table: t},
+	//       Right: LogicalScan{Table: u},
+	//       Predicate: t.a = u.a,
+	//     }
 
 	if bound.Where != nil {
 		plan = LogicalFilter{
@@ -111,6 +118,35 @@ func BuildLogicalSelect(bound *binder.BoundSelect) (LogicalPlan, error) {
 	//     }
 
 	return plan, nil
+}
+
+func buildLogicalFromPlan(bound *binder.BoundSelect) (LogicalPlan, error) {
+	if bound == nil {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "planner: bound select is required")
+	}
+
+	if bound.Join == nil {
+		if len(bound.From) != 1 {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "planner: exactly one FROM table is required when JOIN is absent")
+		}
+		return LogicalScan{
+			Table: bound.From[0],
+		}, nil
+	}
+
+	if len(bound.From) != 2 {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "planner: exactly two FROM tables are required when JOIN is present")
+	}
+
+	return LogicalJoin{
+		Left: LogicalScan{
+			Table: bound.From[0],
+		},
+		Right: LogicalScan{
+			Table: bound.From[1],
+		},
+		Predicate: bound.Join.On,
+	}, nil
 }
 
 func requiresAggregate(bound *binder.BoundSelect) bool {

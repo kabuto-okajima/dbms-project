@@ -25,12 +25,12 @@ func (PhysicalTableScan) isPhysicalPlan() {}
 
 // PhysicalIndexScan reads matching rows through one single-column index.
 type PhysicalIndexScan struct {
-	Table      binder.BoundTable
-	Index      catalog.IndexMetadata
-	Column     binder.BoundColumnRef
-	Operator   statement.ComparisonOperator
-	Value      storage.Value
-	Residual   binder.BoundExpression
+	Table    binder.BoundTable
+	Index    catalog.IndexMetadata
+	Column   binder.BoundColumnRef
+	Operator statement.ComparisonOperator
+	Value    storage.Value
+	Residual binder.BoundExpression
 }
 
 func (PhysicalIndexScan) isPhysicalPlan() {}
@@ -42,6 +42,18 @@ type PhysicalFilter struct {
 }
 
 func (PhysicalFilter) isPhysicalPlan() {}
+
+// PhysicalNestedLoopJoin combines two inputs using one join predicate.
+//
+// The executor does not run this node yet; this step only establishes the
+// physical-plan shape that will be executed in the next step.
+type PhysicalNestedLoopJoin struct {
+	Left      PhysicalPlan
+	Right     PhysicalPlan
+	Predicate binder.BoundExpression
+}
+
+func (PhysicalNestedLoopJoin) isPhysicalPlan() {}
 
 // PhysicalAggregate groups rows and computes aggregate values.
 type PhysicalAggregate struct {

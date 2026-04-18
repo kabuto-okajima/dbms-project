@@ -1,6 +1,7 @@
 package binder
 
 import (
+	"errors"
 	"fmt"
 
 	"dbms-project/internal/catalog"
@@ -26,6 +27,7 @@ func New(manager *catalog.Manager) *Binder {
 type BoundSelect struct {
 	Statement   statement.SelectStatement
 	From        []BoundTable
+	Join        *BoundJoinClause
 	SelectItems []BoundSelectItem
 	Where       BoundExpression
 	GroupBy     []BoundExpression
@@ -38,6 +40,12 @@ type BoundTable struct {
 	Name     string
 	Alias    string
 	Metadata *catalog.TableMetadata
+}
+
+// BoundJoinClause stores the bound ON predicate for one explicit JOIN.
+type BoundJoinClause struct {
+	Type statement.JoinType
+	On   BoundExpression
 }
 
 // BoundExpression is the future expression-level binder contract.
@@ -159,8 +167,13 @@ func (b *Binder) BindSelect(tx *storage.Tx, stmt statement.SelectStatement) (*Bo
 		})
 	}
 
-	if len(boundTables) != 1 {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: multi-table binding is unsupported")
+	if err := validateFromClauseShape(stmt); err != nil {
+		return nil, err
+	}
+
+	boundJoin, err := bindOptionalJoin(boundTables, stmt.Join)
+	if err != nil {
+		return nil, err
 	}
 
 	boundSelectItems := make([]BoundSelectItem, 0, len(stmt.SelectItems))
@@ -216,6 +229,7 @@ func (b *Binder) BindSelect(tx *storage.Tx, stmt statement.SelectStatement) (*Bo
 	bound := &BoundSelect{
 		Statement:   stmt,
 		From:        boundTables,
+		Join:        boundJoin,
 		SelectItems: boundSelectItems,
 		Where:       boundWhere,
 		GroupBy:     boundGroupBy,
@@ -228,6 +242,46 @@ func (b *Binder) BindSelect(tx *storage.Tx, stmt statement.SelectStatement) (*Bo
 	}
 
 	return bound, nil
+}
+
+func validateFromClauseShape(stmt statement.SelectStatement) error {
+	if stmt.Join == nil {
+		if len(stmt.From) != 1 {
+			return shared.NewError(shared.ErrInvalidDefinition, "bind select: exactly one FROM table is required when JOIN is absent")
+		}
+		return nil
+	}
+
+	if len(stmt.From) != 2 {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: exactly two FROM tables are required when JOIN is present")
+	}
+
+	return nil
+}
+
+func bindOptionalJoin(tables []BoundTable, join *statement.JoinClause) (*BoundJoinClause, error) {
+	if join == nil {
+		return nil, nil
+	}
+
+	// For JOIN binding, expression is like:
+	// BoundJoinClause{
+	//   Type: INNER,
+	//   On: BoundComparisonExpr{
+	//     Left: BoundColumnRef{users.id},
+	//     Operator: "=",
+	//     Right: BoundColumnRef{departments.user_id},
+	//   },
+	// }
+	boundOn, err := bindOptionalExpression(tables, join.On)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BoundJoinClause{
+		Type: join.Type,
+		On:   boundOn,
+	}, nil
 }
 
 type bindOptions struct {
@@ -318,26 +372,90 @@ func registerSelectItemAlias(aliases aliasScope, alias string, expr BoundExpress
 }
 
 func bindColumnRef(tables []BoundTable, ref statement.ColumnRef) (BoundExpression, error) {
-	if len(tables) != 1 {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: column resolution for multiple tables is unsupported")
+	if ref.TableName != "" {
+		return bindQualifiedColumnRef(tables, ref)
 	}
+	return bindUnqualifiedColumnRef(tables, ref.ColumnName)
+}
 
-	table := tables[0]
-	if ref.TableName != "" && ref.TableName != table.Name && ref.TableName != table.Alias {
+func bindQualifiedColumnRef(tables []BoundTable, ref statement.ColumnRef) (BoundExpression, error) {
+	tableIndex, table, ok := findBoundTableByName(tables, ref.TableName)
+	if !ok {
 		return nil, shared.NewError(shared.ErrNotFound, "bind select: table or alias %q does not exist in scope", ref.TableName)
 	}
 
-	column, ordinal, err := catalog.ColumnByName(table.Metadata, ref.ColumnName)
+	return bindColumnRefFromTable(tables, tableIndex, table, ref.ColumnName)
+}
+
+func bindUnqualifiedColumnRef(tables []BoundTable, columnName string) (BoundExpression, error) {
+	var (
+		match   BoundColumnRef
+		matched bool
+	)
+	for tableIndex, table := range tables {
+		boundColumn, found, err := tryBindColumnRefFromTable(tables, tableIndex, table, columnName)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+
+		if matched {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: column %q is ambiguous across tables", columnName)
+		}
+
+		match = boundColumn
+		matched = true
+	}
+
+	if !matched {
+		return nil, shared.NewError(shared.ErrNotFound, "bind select: column %q does not exist in scope", columnName)
+	}
+
+	return match, nil
+}
+
+func findBoundTableByName(tables []BoundTable, name string) (int, BoundTable, bool) {
+	for tableIndex, table := range tables {
+		if name == table.Name || name == table.Alias {
+			return tableIndex, table, true
+		}
+	}
+	return 0, BoundTable{}, false
+}
+
+func tryBindColumnRefFromTable(tables []BoundTable, tableIndex int, table BoundTable, columnName string) (BoundColumnRef, bool, error) {
+	boundColumn, err := bindColumnRefFromTable(tables, tableIndex, table, columnName)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, shared.ErrNotFound) {
+			return BoundColumnRef{}, false, nil
+		}
+		return BoundColumnRef{}, false, err
+	}
+	return boundColumn, true, nil
+}
+
+func bindColumnRefFromTable(tables []BoundTable, tableIndex int, table BoundTable, columnName string) (BoundColumnRef, error) {
+	column, ordinal, err := catalog.ColumnByName(table.Metadata, columnName)
+	if err != nil {
+		return BoundColumnRef{}, err
 	}
 
 	return BoundColumnRef{
 		TableName:  table.Name,
 		ColumnName: column.Name,
-		Ordinal:    ordinal,
+		Ordinal:    globalColumnOrdinal(tables, tableIndex, ordinal),
 		Type:       column.Type,
 	}, nil
+}
+
+func globalColumnOrdinal(tables []BoundTable, tableIndex int, tableOrdinal int) int {
+	ordinal := tableOrdinal
+	for i := 0; i < tableIndex; i++ {
+		ordinal += len(tables[i].Metadata.Columns)
+	}
+	return ordinal
 }
 
 // support:
@@ -354,7 +472,7 @@ func bindColumnRef(tables []BoundTable, ref statement.ColumnRef) (BoundExpressio
 //
 // unsupported:
 //   - mixed AND/OR predicate trees
-//   - multi-table queries and JOINs
+//   - non-equi joins and non-column join keys
 //   - subqueries
 func validateBoundSelect(bound *BoundSelect) error {
 	if bound == nil {
@@ -382,12 +500,54 @@ func validateBoundSelect(bound *BoundSelect) error {
 			return err
 		}
 	}
+	if bound.Join != nil {
+		if err := validateOptionalExpressionTypes(bound.Join.On); err != nil {
+			return err
+		}
+	}
 
 	if err := validateWhereExpression(bound.Where); err != nil {
 		return err
 	}
+	if err := validateJoinClause(bound.Join); err != nil {
+		return err
+	}
 
 	return validateAggregateLegality(bound)
+}
+
+func validateJoinClause(join *BoundJoinClause) error {
+	if join == nil {
+		return nil
+	}
+	if join.Type != statement.JoinInner {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: only INNER JOIN is supported")
+	}
+	if join.On == nil {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: JOIN ON predicate is required")
+	}
+
+	comparison, ok := join.On.(BoundComparisonExpr)
+	if !ok {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: JOIN ON must be a single comparison predicate")
+	}
+	if comparison.Operator != statement.OpEqual {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: only equi-join predicates are supported")
+	}
+
+	leftColumn, ok := comparison.Left.(BoundColumnRef)
+	if !ok {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: left JOIN key must be a column reference")
+	}
+	rightColumn, ok := comparison.Right.(BoundColumnRef)
+	if !ok {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: right JOIN key must be a column reference")
+	}
+	if leftColumn.TableName == rightColumn.TableName {
+		return shared.NewError(shared.ErrInvalidDefinition, "bind select: JOIN keys must come from different tables")
+	}
+
+	return nil
 }
 
 func validateOptionalExpressionTypes(expr BoundExpression) error {

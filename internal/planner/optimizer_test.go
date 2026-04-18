@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"dbms-project/internal/binder"
+	"dbms-project/internal/catalog"
+	"dbms-project/internal/shared"
 )
 
 func TestOptimizeRemovesEmptySort(t *testing.T) {
@@ -298,6 +300,229 @@ func TestOptimizePushdownMergesWithAdjacentFilter(t *testing.T) {
 	second := logicalExpr.Terms[1].(binder.BoundComparisonExpr)
 	if first.Operator != "=" || second.Operator != ">" {
 		t.Fatalf("unexpected merged predicate order: %+v", logicalExpr.Terms)
+	}
+}
+
+func TestOptimizePushesJoinSideFiltersBelowJoinAndKeepsResidualAbove(t *testing.T) {
+	studentsTable := binder.BoundTable{
+		Name: "students",
+		Metadata: &catalog.TableMetadata{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "age", Type: shared.TypeInteger},
+			},
+		},
+	}
+	departmentsTable := binder.BoundTable{
+		Name: "departments",
+		Metadata: &catalog.TableMetadata{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+			},
+		},
+	}
+
+	plan := LogicalFilter{
+		Predicate: binder.BoundLogicalExpr{
+			Operator: "AND",
+			Terms: []binder.BoundExpression{
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "age", Ordinal: 1},
+					Operator: "=",
+					Right:    binder.BoundLiteralExpr{},
+				},
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+					Operator: ">",
+					Right:    binder.BoundLiteralExpr{},
+				},
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "id", Ordinal: 0},
+					Operator: "=",
+					Right:    binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+				},
+			},
+		},
+		Input: LogicalJoin{
+			Left: LogicalScan{
+				Table: studentsTable,
+			},
+			Right: LogicalScan{
+				Table: departmentsTable,
+			},
+			Predicate: binder.BoundComparisonExpr{
+				Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "id", Ordinal: 0},
+				Operator: "=",
+				Right:    binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+			},
+		},
+	}
+
+	optimized := Optimize(plan)
+
+	filter, ok := optimized.(LogicalFilter)
+	if !ok {
+		t.Fatalf("expected residual filter above join, got %T", optimized)
+	}
+	join, ok := filter.Input.(LogicalJoin)
+	if !ok {
+		t.Fatalf("expected filter input to be join, got %T", filter.Input)
+	}
+
+	if _, ok := filter.Predicate.(binder.BoundComparisonExpr); !ok {
+		t.Fatalf("expected residual predicate to remain comparison, got %T", filter.Predicate)
+	}
+
+	leftFilter, ok := join.Left.(LogicalFilter)
+	if !ok {
+		t.Fatalf("expected left join input to be filter, got %T", join.Left)
+	}
+	if _, ok := leftFilter.Input.(LogicalScan); !ok {
+		t.Fatalf("expected left pushed filter input to be scan, got %T", leftFilter.Input)
+	}
+
+	rightFilter, ok := join.Right.(LogicalFilter)
+	if !ok {
+		t.Fatalf("expected right join input to be filter, got %T", join.Right)
+	}
+	if _, ok := rightFilter.Input.(LogicalScan); !ok {
+		t.Fatalf("expected right pushed filter input to be scan, got %T", rightFilter.Input)
+	}
+}
+
+func TestOptimizeRemovesTopFilterWhenAllJoinTermsPushDown(t *testing.T) {
+	studentsTable := binder.BoundTable{
+		Name: "students",
+		Metadata: &catalog.TableMetadata{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "age", Type: shared.TypeInteger},
+			},
+		},
+	}
+	departmentsTable := binder.BoundTable{
+		Name: "departments",
+		Metadata: &catalog.TableMetadata{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+			},
+		},
+	}
+
+	plan := LogicalFilter{
+		Predicate: binder.BoundLogicalExpr{
+			Operator: "AND",
+			Terms: []binder.BoundExpression{
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "age", Ordinal: 1},
+					Operator: "=",
+					Right:    binder.BoundLiteralExpr{},
+				},
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+					Operator: ">",
+					Right:    binder.BoundLiteralExpr{},
+				},
+			},
+		},
+		Input: LogicalJoin{
+			Left:  LogicalScan{Table: studentsTable},
+			Right: LogicalScan{Table: departmentsTable},
+			Predicate: binder.BoundComparisonExpr{
+				Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "id", Ordinal: 0},
+				Operator: "=",
+				Right:    binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+			},
+		},
+	}
+
+	optimized := Optimize(plan)
+
+	join, ok := optimized.(LogicalJoin)
+	if !ok {
+		t.Fatalf("expected top filter to disappear, got %T", optimized)
+	}
+	if _, ok := join.Left.(LogicalFilter); !ok {
+		t.Fatalf("expected left pushed filter, got %T", join.Left)
+	}
+	if _, ok := join.Right.(LogicalFilter); !ok {
+		t.Fatalf("expected right pushed filter, got %T", join.Right)
+	}
+}
+
+func TestOptimizeKeepsOrPredicateAboveJoin(t *testing.T) {
+	studentsTable := binder.BoundTable{
+		Name: "students",
+		Metadata: &catalog.TableMetadata{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "age", Type: shared.TypeInteger},
+			},
+		},
+	}
+	departmentsTable := binder.BoundTable{
+		Name: "departments",
+		Metadata: &catalog.TableMetadata{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+		},
+	}
+
+	plan := LogicalFilter{
+		Predicate: binder.BoundLogicalExpr{
+			Operator: "OR",
+			Terms: []binder.BoundExpression{
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "age", Ordinal: 1},
+					Operator: "=",
+					Right:    binder.BoundLiteralExpr{},
+				},
+				binder.BoundComparisonExpr{
+					Left:     binder.BoundColumnRef{TableName: "departments", ColumnName: "name", Ordinal: 3},
+					Operator: "=",
+					Right:    binder.BoundLiteralExpr{},
+				},
+			},
+		},
+		Input: LogicalJoin{
+			Left:  LogicalScan{Table: studentsTable},
+			Right: LogicalScan{Table: departmentsTable},
+			Predicate: binder.BoundComparisonExpr{
+				Left:     binder.BoundColumnRef{TableName: "students", ColumnName: "id", Ordinal: 0},
+				Operator: "=",
+				Right:    binder.BoundColumnRef{TableName: "departments", ColumnName: "id", Ordinal: 2},
+			},
+		},
+	}
+
+	optimized := Optimize(plan)
+
+	filter, ok := optimized.(LogicalFilter)
+	if !ok {
+		t.Fatalf("expected OR filter to remain above join, got %T", optimized)
+	}
+	logicalExpr, ok := filter.Predicate.(binder.BoundLogicalExpr)
+	if !ok || logicalExpr.Operator != "OR" || len(logicalExpr.Terms) != 2 {
+		t.Fatalf("expected OR predicate to remain unchanged, got %+v", filter.Predicate)
+	}
+
+	join, ok := filter.Input.(LogicalJoin)
+	if !ok {
+		t.Fatalf("expected filter input to remain join, got %T", filter.Input)
+	}
+	if _, ok := join.Left.(LogicalFilter); ok {
+		t.Fatalf("expected no pushed filter on left join input, got %T", join.Left)
+	}
+	if _, ok := join.Right.(LogicalFilter); ok {
+		t.Fatalf("expected no pushed filter on right join input, got %T", join.Right)
 	}
 }
 

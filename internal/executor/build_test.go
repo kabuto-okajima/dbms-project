@@ -95,6 +95,114 @@ func TestBuildPhysicalPlanChoosesIndexScanForIndexedPredicate(t *testing.T) {
 	}
 }
 
+func TestBuildPhysicalPlanLowersLogicalJoinToNestedLoopJoin(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		return manager.CreateTable(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		bound, err := binder.New(manager).BindSelect(tx, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{TableName: "s", ColumnName: "name"}, Alias: "student_name"},
+				{Expr: statement.ColumnRef{TableName: "d", ColumnName: "name"}, Alias: "department_name"},
+			},
+			From: []statement.TableRef{
+				{Name: "students", Alias: "s"},
+				{Name: "departments", Alias: "d"},
+			},
+			Join: &statement.JoinClause{
+				Type: statement.JoinInner,
+				On: statement.ComparisonExpr{
+					Left:     statement.ColumnRef{TableName: "s", ColumnName: "dept_id"},
+					Operator: statement.OpEqual,
+					Right:    statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				},
+			},
+			Where: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{TableName: "d", ColumnName: "id"},
+				Operator: statement.OpGreaterThan,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(10)},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		logical, err := planner.BuildLogicalSelect(bound)
+		if err != nil {
+			return err
+		}
+
+		physical, err := BuildPhysicalPlan(tx, logical)
+		if err != nil {
+			return err
+		}
+
+		project, ok := physical.(PhysicalProject)
+		if !ok {
+			t.Fatalf("expected project root, got %T", physical)
+		}
+		filter, ok := project.Input.(PhysicalFilter)
+		if !ok {
+			t.Fatalf("expected project input to be filter, got %T", project.Input)
+		}
+		join, ok := filter.Input.(PhysicalNestedLoopJoin)
+		if !ok {
+			t.Fatalf("expected filter input to be nested-loop join, got %T", filter.Input)
+		}
+		if join.Predicate == nil {
+			t.Fatal("expected join predicate to be populated")
+		}
+
+		leftScan, ok := join.Left.(PhysicalTableScan)
+		if !ok {
+			t.Fatalf("expected join left input to be table scan, got %T", join.Left)
+		}
+		rightScan, ok := join.Right.(PhysicalTableScan)
+		if !ok {
+			t.Fatalf("expected join right input to be table scan, got %T", join.Right)
+		}
+		if leftScan.Table.Name != "students" || rightScan.Table.Name != "departments" {
+			t.Fatalf("unexpected join inputs: left=%q right=%q", leftScan.Table.Name, rightScan.Table.Name)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildPhysicalPlanFallsBackToTableScanWithoutIndex(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 

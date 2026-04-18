@@ -670,6 +670,82 @@ func TestBuildRequestSelectAcceptsAggregatesAndClauses(t *testing.T) {
 	}
 }
 
+func TestBuildRequestSelectAcceptsInnerJoinShape(t *testing.T) {
+	raw, err := Parse("select s.id, d.name from students s join departments d on s.dept_id = d.id where s.id > 1 order by d.name asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectReq, ok := req.(SelectRequest)
+	if !ok {
+		t.Fatalf("expected SelectRequest, got %T", req)
+	}
+	if len(selectReq.Statement.From) != 2 {
+		t.Fatalf("expected 2 FROM tables, got %+v", selectReq.Statement.From)
+	}
+	if selectReq.Statement.From[0] != (statement.TableRef{Name: "students", Alias: "s"}) {
+		t.Fatalf("unexpected left table: %+v", selectReq.Statement.From[0])
+	}
+	if selectReq.Statement.From[1] != (statement.TableRef{Name: "departments", Alias: "d"}) {
+		t.Fatalf("unexpected right table: %+v", selectReq.Statement.From[1])
+	}
+	if selectReq.Statement.Join == nil {
+		t.Fatal("expected join clause to be populated")
+	}
+	if selectReq.Statement.Join.Type != statement.JoinInner {
+		t.Fatalf("expected INNER join type, got %+v", selectReq.Statement.Join)
+	}
+
+	onExpr, ok := selectReq.Statement.Join.On.(statement.ComparisonExpr)
+	if !ok {
+		t.Fatalf("expected ON to be comparison expr, got %T", selectReq.Statement.Join.On)
+	}
+	leftCol, ok := onExpr.Left.(statement.ColumnRef)
+	if !ok {
+		t.Fatalf("expected left ON side to be column ref, got %T", onExpr.Left)
+	}
+	rightCol, ok := onExpr.Right.(statement.ColumnRef)
+	if !ok {
+		t.Fatalf("expected right ON side to be column ref, got %T", onExpr.Right)
+	}
+	if leftCol.TableName != "s" || leftCol.ColumnName != "dept_id" {
+		t.Fatalf("unexpected left ON column: %+v", leftCol)
+	}
+	if rightCol.TableName != "d" || rightCol.ColumnName != "id" {
+		t.Fatalf("unexpected right ON column: %+v", rightCol)
+	}
+}
+
+func TestBuildRequestSelectRejectsUnsupportedJoinShapes(t *testing.T) {
+	tests := []string{
+		"select * from students s left join departments d on s.dept_id = d.id",
+		"select * from students s join departments d using (dept_id)",
+		"select * from students s join departments d",
+	}
+
+	for _, sql := range tests {
+		t.Run(sql, func(t *testing.T) {
+			raw, err := Parse(sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = BuildRequest(raw)
+			if err == nil {
+				t.Fatal("expected invalid-definition error, got nil")
+			}
+			if !errors.Is(err, shared.ErrInvalidDefinition) {
+				t.Fatalf("expected invalid-definition error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestBuildRequestSelectAcceptsLogicalChains(t *testing.T) {
 	raw, err := Parse("select * from students where age = 20 and dept_id = 1 and id = 5")
 	if err != nil {
