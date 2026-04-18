@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"dbms-project/internal/catalog"
 	"dbms-project/internal/binder"
+	"dbms-project/internal/planner"
 	"dbms-project/internal/shared"
 	"dbms-project/internal/statement"
 	"dbms-project/internal/storage"
@@ -30,6 +32,36 @@ type RuntimeRow struct {
 type RuntimeResult struct {
 	Schema RuntimeSchema
 	Rows   []RuntimeRow
+}
+
+// ExecuteSelect runs the full in-process SELECT pipeline:
+// bind -> logical plan -> optimize -> physical plan -> execute.
+func ExecuteSelect(tx *storage.Tx, manager *catalog.Manager, stmt statement.SelectStatement) (RuntimeResult, error) {
+	if tx == nil {
+		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: transaction is required")
+	}
+	if manager == nil {
+		manager = catalog.NewManager()
+	}
+
+	bound, err := binder.New(manager).BindSelect(tx, stmt)
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+
+	logical, err := planner.BuildLogicalSelect(bound)
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+
+	optimized := planner.Optimize(logical)
+
+	physical, err := BuildPhysicalPlan(tx, optimized)
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+
+	return ExecutePlan(tx, physical)
 }
 
 // ExecutePlan runs one physical plan and materializes its full result.

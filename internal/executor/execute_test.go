@@ -2404,6 +2404,175 @@ func TestPhysicalAggregateExecuteGroupsByOneColumnWithSumMinMax(t *testing.T) {
 	}
 }
 
+func TestExecuteSelectRunsSingleTablePipeline(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+				{Name: "age", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		if err := manager.CreateIndex(tx, shared.IndexDefinition{
+			Name:       "idx_students_age",
+			TableName:  "students",
+			ColumnName: "age",
+		}); err != nil {
+			return err
+		}
+
+		insertExec := statement.NewInsertExecutor(manager)
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewStringValue("Alice"), storage.NewIntegerValue(19)},
+			{storage.NewIntegerValue(2), storage.NewStringValue("Bob"), storage.NewIntegerValue(20)},
+			{storage.NewIntegerValue(3), storage.NewStringValue("Carol"), storage.NewIntegerValue(20)},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		result, err := ExecuteSelect(tx, manager, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{ColumnName: "name"}},
+			},
+			From: []statement.TableRef{
+				{Name: "students"},
+			},
+			Where: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{ColumnName: "age"},
+				Operator: statement.OpEqual,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(20)},
+			},
+			OrderBy: []statement.OrderByTerm{
+				{Expr: statement.ColumnRef{ColumnName: "name"}, Desc: true},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(result.Schema) != 1 || result.Schema[0].Name != "name" {
+			t.Fatalf("unexpected ExecuteSelect schema: %+v", result.Schema)
+		}
+		if len(result.Rows) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(result.Rows))
+		}
+		if result.Rows[0].Values[0] != storage.NewStringValue("Carol") || result.Rows[1].Values[0] != storage.NewStringValue("Bob") {
+			t.Fatalf("unexpected ExecuteSelect rows: %+v", result.Rows)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecuteSelectRunsGroupedHavingPipeline(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		if err := manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+
+		insertExec := statement.NewInsertExecutor(manager)
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewIntegerValue(10)},
+			{storage.NewIntegerValue(2), storage.NewIntegerValue(20)},
+			{storage.NewIntegerValue(3), storage.NewIntegerValue(10)},
+		} {
+			if _, err := insertExec.Execute(tx, statement.InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		result, err := ExecuteSelect(tx, manager, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{ColumnName: "dept_id"}},
+				{Expr: statement.AggregateExpr{Function: statement.AggCount, Arg: statement.StarExpr{}}},
+			},
+			From: []statement.TableRef{
+				{Name: "students"},
+			},
+			GroupBy: []statement.Expression{
+				statement.ColumnRef{ColumnName: "dept_id"},
+			},
+			Having: statement.ComparisonExpr{
+				Left:     statement.AggregateExpr{Function: statement.AggCount, Arg: statement.StarExpr{}},
+				Operator: statement.OpGreaterThan,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(result.Schema) != 2 {
+			t.Fatalf("unexpected grouped schema: %+v", result.Schema)
+		}
+		if len(result.Rows) != 1 || len(result.Rows[0].Values) != 2 {
+			t.Fatalf("unexpected grouped rows: %+v", result.Rows)
+		}
+		if result.Rows[0].Values[0] != storage.NewIntegerValue(10) || result.Rows[0].Values[1] != storage.NewIntegerValue(2) {
+			t.Fatalf("unexpected grouped ExecuteSelect row: %+v", result.Rows[0])
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExecutePlanProjectsGroupedSumWithHaving(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 
