@@ -46,7 +46,6 @@ func tryBuildIndexScan(tx *storage.Tx, filter planner.LogicalFilter) (PhysicalPl
 
 // indexEligiblePredicate finds one index-eligible predicate term and returns
 // the remaining terms as a residual predicate.
-// e.g., for "WHERE a = 5 AND b > 10 AND c < 20", it might return the "a = 5" term for index scanning and combine the other two terms back into "(b > 10 AND c < 20)" as the residual for full scan.
 func indexEligiblePredicate(expr binder.BoundExpression) (binder.BoundColumnRef, binder.BoundLiteralExpr, statement.ComparisonOperator, binder.BoundExpression, bool) {
 	if comparison, ok := expr.(binder.BoundComparisonExpr); ok {
 		column, literal, operator, ok := indexEligibleComparison(comparison)
@@ -59,6 +58,15 @@ func indexEligiblePredicate(expr binder.BoundExpression) (binder.BoundColumnRef,
 	logicalExpr, ok := expr.(binder.BoundLogicalExpr)
 	if !ok || logicalExpr.Operator != statement.OpAnd {
 		return binder.BoundColumnRef{}, binder.BoundLiteralExpr{}, "", nil, false
+	}
+
+	// age = 20 AND id > 2
+	// -> use age = 20 first, keep id > 2 as residual
+	if firstComparison, ok := logicalExpr.Terms[0].(binder.BoundComparisonExpr); ok {
+		column, literal, operator, ok := indexEligibleComparison(firstComparison)
+		if ok {
+			return column, literal, operator, combineResidualTerms(logicalExpr.Terms[1:]), true
+		}
 	}
 
 	for i, term := range logicalExpr.Terms {
