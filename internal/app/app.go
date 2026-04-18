@@ -1,6 +1,7 @@
 package app
 
 import (
+	"dbms-project/internal/binder"
 	"dbms-project/internal/catalog"
 	"dbms-project/internal/executor"
 	"dbms-project/internal/parser"
@@ -142,13 +143,37 @@ func (a *App) executeInsert(request parser.InsertRequest) (Result, error) {
 
 func (a *App) executeDelete(request parser.DeleteRequest) (Result, error) {
 	return a.executeWriteRequest(request.Kind(), func(tx *storage.Tx) (statement.Result, error) {
-		return statement.NewDeleteExecutor(a.catalogManager()).Execute(tx, request.Statement)
+		stmt := request.Statement
+		if stmt.Where != nil {
+			// e.g., for DELETE FROM users WHERE id = 42, stmt.TableName is "users" and stmt.Where is the parsed form of "id = 42".
+			// boundPredicate is a function that takes a storage.Row and returns whether that row matches the WHERE condition.
+			boundPredicate, err := binder.New(a.catalogManager()).BindTablePredicate(tx, stmt.TableName, stmt.Where)
+			if err != nil {
+				return statement.Result{}, err
+			}
+			stmt.Matcher = func(row storage.Row) (bool, error) {
+				// evaluate the bound predicate against the given row.
+				// e.g., for "DELETE FROM users WHERE id = 42", this will check whether the "id" column in the row equals 42.
+				return executor.EvaluatePredicate(boundPredicate, executor.RuntimeRow{Values: row})
+			}
+		}
+		return statement.NewDeleteExecutor(a.catalogManager()).Execute(tx, stmt)
 	})
 }
 
 func (a *App) executeUpdate(request parser.UpdateRequest) (Result, error) {
 	return a.executeWriteRequest(request.Kind(), func(tx *storage.Tx) (statement.Result, error) {
-		return statement.NewUpdateExecutor(a.catalogManager()).Execute(tx, request.Statement)
+		stmt := request.Statement
+		if stmt.Where != nil {
+			boundPredicate, err := binder.New(a.catalogManager()).BindTablePredicate(tx, stmt.TableName, stmt.Where)
+			if err != nil {
+				return statement.Result{}, err
+			}
+			stmt.Matcher = func(row storage.Row) (bool, error) {
+				return executor.EvaluatePredicate(boundPredicate, executor.RuntimeRow{Values: row})
+			}
+		}
+		return statement.NewUpdateExecutor(a.catalogManager()).Execute(tx, stmt)
 	})
 }
 

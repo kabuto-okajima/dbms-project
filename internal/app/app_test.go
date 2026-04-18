@@ -412,6 +412,105 @@ func TestExecuteSQLRunsWriteDMLLifecycle(t *testing.T) {
 	}
 }
 
+func TestExecuteSQLDeleteWithWhereRemovesOnlyMatchingRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	app, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	if _, err := app.ExecuteSQL("create table students (id int primary key, name varchar(255))"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("create index idx_students_name on students (name)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (1, 'Ada')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (2, 'Grace')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (3, 'Ada')"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := app.ExecuteSQL("delete from students where name = 'Ada'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kind != parser.StatementDelete {
+		t.Fatalf("expected delete kind, got %q", result.Kind)
+	}
+	if result.Message != "2 rows deleted" || result.AffectedRows != 2 {
+		t.Fatalf("unexpected delete result: %+v", result)
+	}
+
+	rows, err := loadTableRows(app, "students")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRows := []storage.Row{{
+		storage.NewIntegerValue(2),
+		storage.NewStringValue("Grace"),
+	}}
+	if !reflect.DeepEqual(rows, wantRows) {
+		t.Fatalf("unexpected rows after predicate delete: got %+v want %+v", rows, wantRows)
+	}
+}
+
+func TestExecuteSQLUpdateWithWhereRewritesOnlyMatchingRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	app, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	if _, err := app.ExecuteSQL("create table students (id int primary key, name varchar(255))"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("create index idx_students_name on students (name)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (1, 'Ada')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (2, 'Grace')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ExecuteSQL("insert into students (id, name) values (3, 'Ada')"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := app.ExecuteSQL("update students set name = 'Updated' where name = 'Ada'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kind != parser.StatementUpdate {
+		t.Fatalf("expected update kind, got %q", result.Kind)
+	}
+	if result.Message != "2 rows updated" || result.AffectedRows != 2 {
+		t.Fatalf("unexpected update result: %+v", result)
+	}
+
+	rows, err := loadTableRows(app, "students")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRows := []storage.Row{
+		{storage.NewIntegerValue(1), storage.NewStringValue("Updated")},
+		{storage.NewIntegerValue(2), storage.NewStringValue("Grace")},
+		{storage.NewIntegerValue(3), storage.NewStringValue("Updated")},
+	}
+	if !reflect.DeepEqual(rows, wantRows) {
+		t.Fatalf("unexpected rows after predicate update: got %+v want %+v", rows, wantRows)
+	}
+}
+
 func TestExecuteSQLWriteDMLFailureRollsBack(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 

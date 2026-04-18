@@ -20,6 +20,41 @@ func New(manager *catalog.Manager) *Binder {
 	return &Binder{Catalog: manager}
 }
 
+// BindTablePredicate resolves one optional predicate expression against a
+// single table for DML statements such as DELETE and UPDATE.
+func (b *Binder) BindTablePredicate(tx *storage.Tx, tableName string, expr statement.Expression) (BoundExpression, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("binder: transaction is required")
+	}
+	if tableName == "" {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "bind predicate: table name is required")
+	}
+
+	// example:
+	// for DELETE FROM users WHERE id = 42, tableName is "users" and expr is the parsed form of "id = 42".
+	// for UPDATE users SET name = 'Alice' WHERE id = 42, tableName is "users" and expr is the parsed form of "id = 42".
+	tables, err := b.bindTables(tx, []statement.TableRef{{Name: tableName}})
+	if err != nil {
+		return nil, err
+	}
+
+	boundExpr, err := bindOptionalExpression(tables, expr)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateOptionalExpressionTypes(boundExpr); err != nil {
+		return nil, err
+	}
+	if err := validateWhereExpression(boundExpr); err != nil {
+		return nil, err
+	}
+	if containsAggregate(boundExpr) {
+		return nil, shared.NewError(shared.ErrInvalidDefinition, "bind predicate: aggregates are unsupported in DML WHERE clauses")
+	}
+
+	return boundExpr, nil
+}
+
 // BoundSelect is the binder output contract for one SELECT statement.
 //
 // In this first step, the binder fully resolves FROM tables and leaves the
@@ -130,41 +165,9 @@ func (b *Binder) BindSelect(tx *storage.Tx, stmt statement.SelectStatement) (*Bo
 		return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: at least one FROM table is required")
 	}
 
-	manager := b.Catalog
-	if manager == nil {
-		manager = catalog.NewManager()
-	}
-
-	boundTables := make([]BoundTable, 0, len(stmt.From))
-	seenNames := make(map[string]struct{}, len(stmt.From)*2)
-
-	for _, tableRef := range stmt.From {
-		if tableRef.Name == "" {
-			return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: table name is required")
-		}
-
-		metadata, err := manager.GetTable(tx, tableRef.Name)
-		if err != nil {
-			return nil, err
-		}
-
-		lookupNames := []string{tableRef.Name}
-		if tableRef.Alias != "" {
-			lookupNames = append(lookupNames, tableRef.Alias)
-		}
-		// Check for duplicate table names or aliases in the FROM clause.
-		for _, name := range lookupNames {
-			if _, exists := seenNames[name]; exists {
-				return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: duplicate table name or alias %q", name)
-			}
-			seenNames[name] = struct{}{}
-		}
-
-		boundTables = append(boundTables, BoundTable{
-			Name:     tableRef.Name,
-			Alias:    tableRef.Alias,
-			Metadata: metadata,
-		})
+	boundTables, err := b.bindTables(tx, stmt.From)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := validateFromClauseShape(stmt); err != nil {
@@ -242,6 +245,47 @@ func (b *Binder) BindSelect(tx *storage.Tx, stmt statement.SelectStatement) (*Bo
 	}
 
 	return bound, nil
+}
+
+// bindTables resolves one or more table references in the FROM clause against the catalog.
+func (b *Binder) bindTables(tx *storage.Tx, refs []statement.TableRef) ([]BoundTable, error) {
+	manager := b.Catalog
+	if manager == nil {
+		manager = catalog.NewManager()
+	}
+
+	boundTables := make([]BoundTable, 0, len(refs))
+	seenNames := make(map[string]struct{}, len(refs)*2)
+
+	for _, tableRef := range refs {
+		if tableRef.Name == "" {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: table name is required")
+		}
+
+		metadata, err := manager.GetTable(tx, tableRef.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		lookupNames := []string{tableRef.Name}
+		if tableRef.Alias != "" {
+			lookupNames = append(lookupNames, tableRef.Alias)
+		}
+		for _, name := range lookupNames {
+			if _, exists := seenNames[name]; exists {
+				return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: duplicate table name or alias %q", name)
+			}
+			seenNames[name] = struct{}{}
+		}
+
+		boundTables = append(boundTables, BoundTable{
+			Name:     tableRef.Name,
+			Alias:    tableRef.Alias,
+			Metadata: metadata,
+		})
+	}
+
+	return boundTables, nil
 }
 
 func validateFromClauseShape(stmt statement.SelectStatement) error {

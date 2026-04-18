@@ -402,13 +402,9 @@ func buildDeleteRequest(stmt *sqlparser.Delete) (Request, error) {
 	// - DELETE FROM one table
 	//
 	// Unsupported as of now:
-	// - WHERE
 	// - ORDER BY / LIMIT
 	// - multi-table DELETE
 	// - partition deletes
-	if stmt.Where != nil {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "delete: WHERE is unsupported")
-	}
 	if len(stmt.OrderBy) > 0 || stmt.Limit != nil {
 		return nil, shared.NewError(shared.ErrInvalidDefinition, "delete: ORDER BY and LIMIT are unsupported")
 	}
@@ -426,10 +422,15 @@ func buildDeleteRequest(stmt *sqlparser.Delete) (Request, error) {
 	if err != nil {
 		return nil, err
 	}
+	where, err := buildOptionalExpression(stmt.Where)
+	if err != nil {
+		return nil, err
+	}
 
 	return DeleteRequest{
 		Statement: statement.DeleteStatement{
 			TableName: tableName,
+			Where:     where,
 		},
 	}, nil
 }
@@ -447,13 +448,9 @@ func buildUpdateRequest(stmt *sqlparser.Update) (Request, error) {
 	// - integer/string literal value
 	//
 	// Unsupported as of now:
-	// - WHERE
 	// - ORDER BY / LIMIT
 	// - multi-table UPDATE
 	// - multiple assignments
-	if stmt.Where != nil {
-		return nil, shared.NewError(shared.ErrInvalidDefinition, "update: WHERE is unsupported")
-	}
 	if len(stmt.OrderBy) > 0 || stmt.Limit != nil {
 		return nil, shared.NewError(shared.ErrInvalidDefinition, "update: ORDER BY and LIMIT are unsupported")
 	}
@@ -472,12 +469,17 @@ func buildUpdateRequest(stmt *sqlparser.Update) (Request, error) {
 	if err != nil {
 		return nil, err
 	}
+	where, err := buildOptionalExpression(stmt.Where)
+	if err != nil {
+		return nil, err
+	}
 
 	return UpdateRequest{
 		Statement: statement.UpdateStatement{
 			TableName:  tableName,
 			ColumnName: assignment.ColumnName,
 			Value:      assignment.Value,
+			Where:      where,
 		},
 	}, nil
 }

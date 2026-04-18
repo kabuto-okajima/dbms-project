@@ -373,6 +373,160 @@ func TestBindSelectRejectsTypeMismatch(t *testing.T) {
 	}
 }
 
+func TestBindTablePredicate(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		return manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+				{Name: "dept_id", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		expr statement.Expression
+		want error
+		check func(t *testing.T, expr BoundExpression)
+	}{
+		{
+			name: "nil predicate",
+			expr: nil,
+			check: func(t *testing.T, expr BoundExpression) {
+				if expr != nil {
+					t.Fatalf("expected nil predicate, got %T", expr)
+				}
+			},
+		},
+		{
+			name: "comparison predicate",
+			expr: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{ColumnName: "id"},
+				Operator: statement.OpEqual,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+			},
+			check: func(t *testing.T, expr BoundExpression) {
+				comparison, ok := expr.(BoundComparisonExpr)
+				if !ok {
+					t.Fatalf("expected comparison predicate, got %T", expr)
+				}
+				column, ok := comparison.Left.(BoundColumnRef)
+				if !ok {
+					t.Fatalf("expected bound column on left side, got %T", comparison.Left)
+				}
+				if column.TableName != "students" || column.ColumnName != "id" || column.Ordinal != 0 {
+					t.Fatalf("unexpected bound column: %+v", column)
+				}
+			},
+		},
+		{
+			name: "logical predicate",
+			expr: statement.LogicalExpr{
+				Operator: statement.OpAnd,
+				Terms: []statement.Expression{
+					statement.ComparisonExpr{
+						Left:     statement.ColumnRef{ColumnName: "id"},
+						Operator: statement.OpEqual,
+						Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+					},
+					statement.ComparisonExpr{
+						Left:     statement.ColumnRef{ColumnName: "dept_id"},
+						Operator: statement.OpEqual,
+						Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(2)},
+					},
+				},
+			},
+			check: func(t *testing.T, expr BoundExpression) {
+				logical, ok := expr.(BoundLogicalExpr)
+				if !ok {
+					t.Fatalf("expected logical predicate, got %T", expr)
+				}
+				if logical.Operator != statement.OpAnd || len(logical.Terms) != 2 {
+					t.Fatalf("unexpected logical predicate: %+v", logical)
+				}
+			},
+		},
+		{
+			name: "unknown column",
+			expr: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{ColumnName: "missing"},
+				Operator: statement.OpEqual,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+			},
+			want: shared.ErrNotFound,
+		},
+		{
+			name: "type mismatch",
+			expr: statement.ComparisonExpr{
+				Left:     statement.ColumnRef{ColumnName: "id"},
+				Operator: statement.OpEqual,
+				Right:    statement.LiteralExpr{Value: storage.NewStringValue("Ada")},
+			},
+			want: shared.ErrTypeMismatch,
+		},
+		{
+			name: "aggregate is rejected",
+			expr: statement.ComparisonExpr{
+				Left: statement.AggregateExpr{
+					Function: statement.AggCount,
+					Arg:      statement.StarExpr{},
+				},
+				Operator: statement.OpGreaterThan,
+				Right:    statement.LiteralExpr{Value: storage.NewIntegerValue(1)},
+			},
+			want: shared.ErrInvalidDefinition,
+		},
+		{
+			name: "scalar expression is rejected",
+			expr: statement.ColumnRef{ColumnName: "id"},
+			want: shared.ErrInvalidDefinition,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := store.View(func(tx *storage.Tx) error {
+				bound, err := New(manager).BindTablePredicate(tx, "students", tt.expr)
+				if tt.want != nil {
+					if err == nil {
+						t.Fatal("expected bind error, got nil")
+					}
+					if !errors.Is(err, tt.want) {
+						t.Fatalf("expected %v, got %v", tt.want, err)
+					}
+					return nil
+				}
+
+				if err != nil {
+					return err
+				}
+				if tt.check != nil {
+					tt.check(t, bound)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestBindSelectRejectsInvalidAggregateUsage(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 

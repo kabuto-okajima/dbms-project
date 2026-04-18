@@ -11,7 +11,12 @@ import (
 // DeleteStatement is the minimal DELETE shape for full-table deletion.
 type DeleteStatement struct {
 	TableName string
+	Where     Expression
+	Matcher   RowPredicate
 }
+
+// RowPredicate decides whether one stored row should be affected by a DML statement.
+type RowPredicate func(storage.Row) (bool, error)
 
 // DeleteExecutor removes rows from table storage and keeps indexes in sync.
 type DeleteExecutor struct {
@@ -27,9 +32,7 @@ func NewDeleteExecutor(manager *catalog.Manager) *DeleteExecutor {
 	return &DeleteExecutor{Catalog: manager}
 }
 
-// Execute deletes every row in the target table.
-//
-// WHERE support can layer on top of this later.
+// Execute deletes every matching row in the target table.
 func (e *DeleteExecutor) Execute(tx *storage.Tx, stmt DeleteStatement) (Result, error) {
 	if e.Catalog == nil {
 		e.Catalog = catalog.NewManager()
@@ -48,6 +51,15 @@ func (e *DeleteExecutor) Execute(tx *storage.Tx, stmt DeleteStatement) (Result, 
 		row, err := storage.DecodeRow(payload)
 		if err != nil {
 			return err
+		}
+		if stmt.Matcher != nil {
+			match, err := stmt.Matcher(row)
+			if err != nil {
+				return err
+			}
+			if !match {
+				return nil
+			}
 		}
 
 		rowsToDelete = append(rowsToDelete, rowToDelete{

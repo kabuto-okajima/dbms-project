@@ -151,6 +151,7 @@ func EvaluatePredicate(expr binder.BoundExpression, row RuntimeRow) (bool, error
 		}
 		return compareValues(left, valueExpr.Operator, right)
 	case binder.BoundLogicalExpr:
+		// logical expressions like "WHERE column1 > 5 AND column2 = 'foo'"
 		if len(valueExpr.Terms) == 0 {
 			return false, shared.NewError(shared.ErrInvalidDefinition, "executor: logical predicate must contain at least one term")
 		}

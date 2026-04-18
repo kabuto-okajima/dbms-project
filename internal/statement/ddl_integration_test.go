@@ -1440,6 +1440,294 @@ func TestUpdateMaintainsIndexes(t *testing.T) {
 	}
 }
 
+func TestUpdatePredicateUpdatesOnlyMatchingRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	createTable := NewCreateTableExecutor(manager)
+	createIndex := NewCreateIndexExecutor(manager)
+	insert := NewInsertExecutor(manager)
+	updateExec := NewUpdateExecutor(manager)
+
+	err = store.Update(func(tx *storage.Tx) error {
+		if _, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		_, err := createIndex.Execute(tx, shared.IndexDefinition{
+			Name:       "idx_students_name",
+			TableName:  "students",
+			ColumnName: "name",
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewStringValue("Ada")},
+			{storage.NewIntegerValue(2), storage.NewStringValue("Grace")},
+			{storage.NewIntegerValue(3), storage.NewStringValue("Ada")},
+		} {
+			if _, err := insert.Execute(tx, InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		result, err := updateExec.Execute(tx, UpdateStatement{
+			TableName:  "students",
+			ColumnName: "name",
+			Value:      storage.NewStringValue("Updated"),
+			Matcher: func(row storage.Row) (bool, error) {
+				return len(row) >= 2 && row[1] == storage.NewStringValue("Ada"), nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if result.AffectedRows != 2 || result.Message != "2 rows updated" {
+			t.Fatalf("unexpected update result: %+v", result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		table, err := manager.GetTable(tx, "students")
+		if err != nil {
+			return err
+		}
+
+		rowsByRID := map[storage.RID]storage.Row{}
+		if err := tx.ForEach(table.TableBucket, func(key, value []byte) error {
+			row, err := storage.DecodeRow(value)
+			if err != nil {
+				return err
+			}
+			rowsByRID[storage.DecodeRID(key)] = row
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		if row := rowsByRID[1]; len(row) != 2 || row[1] != storage.NewStringValue("Updated") {
+			t.Fatalf("unexpected row 1 after selective update: %+v", row)
+		}
+		if row := rowsByRID[2]; len(row) != 2 || row[1] != storage.NewStringValue("Grace") {
+			t.Fatalf("unexpected row 2 after selective update: %+v", row)
+		}
+		if row := rowsByRID[3]; len(row) != 2 || row[1] != storage.NewStringValue("Updated") {
+			t.Fatalf("unexpected row 3 after selective update: %+v", row)
+		}
+
+		indexMeta, err := manager.GetIndex(tx, "idx_students_name")
+		if err != nil {
+			return err
+		}
+		adaKey, err := storage.EncodeIndexKey(storage.NewStringValue("Ada"))
+		if err != nil {
+			return err
+		}
+		adaData, err := tx.Get(indexMeta.IndexBucket, adaKey)
+		if err != nil {
+			return err
+		}
+		if adaData != nil {
+			t.Fatalf("expected Ada index entry to be gone, found %v", adaData)
+		}
+
+		graceKey, err := storage.EncodeIndexKey(storage.NewStringValue("Grace"))
+		if err != nil {
+			return err
+		}
+		graceData, err := tx.Get(indexMeta.IndexBucket, graceKey)
+		if err != nil {
+			return err
+		}
+		graceRIDs, err := storage.DecodeRIDList(graceData)
+		if err != nil {
+			return err
+		}
+		if len(graceRIDs) != 1 || graceRIDs[0] != 2 {
+			t.Fatalf("unexpected Grace RID list after selective update: %+v", graceRIDs)
+		}
+
+		updatedKey, err := storage.EncodeIndexKey(storage.NewStringValue("Updated"))
+		if err != nil {
+			return err
+		}
+		updatedData, err := tx.Get(indexMeta.IndexBucket, updatedKey)
+		if err != nil {
+			return err
+		}
+		updatedRIDs, err := storage.DecodeRIDList(updatedData)
+		if err != nil {
+			return err
+		}
+		if len(updatedRIDs) != 2 || updatedRIDs[0] != 1 || updatedRIDs[1] != 3 {
+			t.Fatalf("unexpected Updated RID list after selective update: %+v", updatedRIDs)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdatePredicateRestrictOnlyChecksMatchedRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	createTable := NewCreateTableExecutor(manager)
+	insert := NewInsertExecutor(manager)
+	updateExec := NewUpdateExecutor(manager)
+
+	err = store.Update(func(tx *storage.Tx) error {
+		if _, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		_, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+			ForeignKeys: []shared.ForeignKeyDefinition{
+				{ColumnName: "dept_id", RefTable: "departments", RefColumn: "id"},
+			},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(10), storage.NewStringValue("Engineering")},
+			{storage.NewIntegerValue(20), storage.NewStringValue("Math")},
+			{storage.NewIntegerValue(30), storage.NewStringValue("Physics")},
+		} {
+			if _, err := insert.Execute(tx, InsertStatement{
+				TableName: "departments",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		_, err := insert.Execute(tx, InsertStatement{
+			TableName: "students",
+			Values: []storage.Value{
+				storage.NewIntegerValue(1),
+				storage.NewIntegerValue(10),
+			},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		result, err := updateExec.Execute(tx, UpdateStatement{
+			TableName:  "departments",
+			ColumnName: "id",
+			Value:      storage.NewIntegerValue(40),
+			Matcher: func(row storage.Row) (bool, error) {
+				return len(row) >= 1 && row[0] == storage.NewIntegerValue(20), nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if result.AffectedRows != 1 || result.Message != "1 rows updated" {
+			t.Fatalf("unexpected update result: %+v", result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		table, err := manager.GetTable(tx, "departments")
+		if err != nil {
+			return err
+		}
+		ids := make([]storage.Value, 0)
+		if err := tx.ForEach(table.TableBucket, func(_ []byte, payload []byte) error {
+			row, err := storage.DecodeRow(payload)
+			if err != nil {
+				return err
+			}
+			ids = append(ids, row[0])
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(ids) != 3 {
+			t.Fatalf("expected 3 department rows after selective update, found %d", len(ids))
+		}
+		found10, found30, found40 := false, false, false
+		for _, id := range ids {
+			switch id {
+			case storage.NewIntegerValue(10):
+				found10 = true
+			case storage.NewIntegerValue(30):
+				found30 = true
+			case storage.NewIntegerValue(40):
+				found40 = true
+			}
+		}
+		if !found10 || !found30 || !found40 {
+			t.Fatalf("unexpected department ids after selective update: %+v", ids)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestUpdateRejectsDuplicateUniqueIndex confirms unique secondary indexes still reject duplicate UPDATE keys.
 func TestUpdateRejectsDuplicateUniqueIndex(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -1655,6 +1943,258 @@ func TestUpdateRejectsDuplicatePrimaryKey(t *testing.T) {
 	})
 	if !errors.Is(err, shared.ErrConstraintViolation) {
 		t.Fatalf("expected transaction to return constraint-violation error, got %v", err)
+	}
+}
+
+func TestDeleteStatementPredicateDeletesOnlyMatchingRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	createTable := NewCreateTableExecutor(manager)
+	createIndex := NewCreateIndexExecutor(manager)
+	insert := NewInsertExecutor(manager)
+	deleteExec := NewDeleteExecutor(manager)
+
+	err = store.Update(func(tx *storage.Tx) error {
+		if _, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		_, err := createIndex.Execute(tx, shared.IndexDefinition{
+			Name:       "idx_students_name",
+			TableName:  "students",
+			ColumnName: "name",
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		rows := []storage.Row{
+			{storage.NewIntegerValue(1), storage.NewStringValue("Ada")},
+			{storage.NewIntegerValue(2), storage.NewStringValue("Grace")},
+			{storage.NewIntegerValue(3), storage.NewStringValue("Ada")},
+		}
+		for _, row := range rows {
+			if _, err := insert.Execute(tx, InsertStatement{
+				TableName: "students",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		result, err := deleteExec.Execute(tx, DeleteStatement{
+			// "DELETE FROM students WHERE name = 'Ada'"
+			TableName: "students",
+			Matcher: func(row storage.Row) (bool, error) {
+				return len(row) >= 2 && row[1] == storage.NewStringValue("Ada"), nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if result.AffectedRows != 2 || result.Message != "2 rows deleted" {
+			t.Fatalf("unexpected delete result: %+v", result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		rows := make([]storage.Row, 0)
+		table, err := manager.GetTable(tx, "students")
+		if err != nil {
+			return err
+		}
+		if err := tx.ForEach(table.TableBucket, func(_ []byte, payload []byte) error {
+			row, err := storage.DecodeRow(payload)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, row)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 remaining row, found %d", len(rows))
+		}
+		if got := rows[0]; len(got) != 2 || got[0] != storage.NewIntegerValue(2) || got[1] != storage.NewStringValue("Grace") {
+			t.Fatalf("unexpected remaining row: %+v", got)
+		}
+
+		indexMeta, err := manager.GetIndex(tx, "idx_students_name")
+		if err != nil {
+			return err
+		}
+
+		adaKey, err := storage.EncodeIndexKey(storage.NewStringValue("Ada"))
+		if err != nil {
+			return err
+		}
+		adaData, err := tx.Get(indexMeta.IndexBucket, adaKey)
+		if err != nil {
+			return err
+		}
+		if adaData != nil {
+			t.Fatalf("expected Ada index entry to be gone, found %v", adaData)
+		}
+
+		graceKey, err := storage.EncodeIndexKey(storage.NewStringValue("Grace"))
+		if err != nil {
+			return err
+		}
+		graceData, err := tx.Get(indexMeta.IndexBucket, graceKey)
+		if err != nil {
+			return err
+		}
+		graceRIDs, err := storage.DecodeRIDList(graceData)
+		if err != nil {
+			return err
+		}
+		if len(graceRIDs) != 1 {
+			t.Fatalf("expected one Grace RID, got %+v", graceRIDs)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteStatementPredicateRestrictOnlyChecksMatchedRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	createTable := NewCreateTableExecutor(manager)
+	insert := NewInsertExecutor(manager)
+	deleteExec := NewDeleteExecutor(manager)
+
+	err = store.Update(func(tx *storage.Tx) error {
+		if _, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "departments",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "name", Type: shared.TypeString},
+			},
+			PrimaryKey: []string{"id"},
+		}); err != nil {
+			return err
+		}
+		_, err := createTable.Execute(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "dept_id", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+			ForeignKeys: []shared.ForeignKeyDefinition{
+				{ColumnName: "dept_id", RefTable: "departments", RefColumn: "id"},
+			},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		for _, row := range []storage.Row{
+			{storage.NewIntegerValue(10), storage.NewStringValue("Engineering")},
+			{storage.NewIntegerValue(20), storage.NewStringValue("Math")},
+		} {
+			if _, err := insert.Execute(tx, InsertStatement{
+				TableName: "departments",
+				Values:    row,
+			}); err != nil {
+				return err
+			}
+		}
+		_, err := insert.Execute(tx, InsertStatement{
+			TableName: "students",
+			Values: []storage.Value{
+				storage.NewIntegerValue(1),
+				storage.NewIntegerValue(10),
+			},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.Update(func(tx *storage.Tx) error {
+		result, err := deleteExec.Execute(tx, DeleteStatement{
+			TableName: "departments",
+			Matcher: func(row storage.Row) (bool, error) {
+				return len(row) >= 1 && row[0] == storage.NewIntegerValue(20), nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if result.AffectedRows != 1 || result.Message != "1 rows deleted" {
+			t.Fatalf("unexpected delete result: %+v", result)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		table, err := manager.GetTable(tx, "departments")
+		if err != nil {
+			return err
+		}
+		ids := make([]storage.Value, 0)
+		if err := tx.ForEach(table.TableBucket, func(_ []byte, payload []byte) error {
+			row, err := storage.DecodeRow(payload)
+			if err != nil {
+				return err
+			}
+			ids = append(ids, row[0])
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(ids) != 1 || ids[0] != storage.NewIntegerValue(10) {
+			t.Fatalf("unexpected department ids after delete: %+v", ids)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

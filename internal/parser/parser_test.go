@@ -518,20 +518,29 @@ func TestBuildRequestDeleteAcceptsBasicShape(t *testing.T) {
 	if deleteReq.Statement.TableName != "students" {
 		t.Fatalf("expected table name students, got %q", deleteReq.Statement.TableName)
 	}
+	if deleteReq.Statement.Where != nil {
+		t.Fatalf("expected nil WHERE expression, got %T", deleteReq.Statement.Where)
+	}
 }
 
-func TestBuildRequestDeleteRejectsWhere(t *testing.T) {
+func TestBuildRequestDeleteAcceptsWhere(t *testing.T) {
 	raw, err := Parse("delete from students where id = 1")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = BuildRequest(raw)
-	if err == nil {
-		t.Fatal("expected invalid-definition error, got nil")
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, shared.ErrInvalidDefinition) {
-		t.Fatalf("expected invalid-definition error, got %v", err)
+
+	deleteReq := req.(DeleteRequest)
+	whereExpr, ok := deleteReq.Statement.Where.(statement.ComparisonExpr)
+	if !ok {
+		t.Fatalf("expected comparison WHERE expression, got %T", deleteReq.Statement.Where)
+	}
+	if whereExpr.Operator != statement.OpEqual {
+		t.Fatalf("expected = WHERE operator, got %q", whereExpr.Operator)
 	}
 }
 
@@ -574,20 +583,77 @@ func TestBuildRequestUpdateAcceptsBasicShape(t *testing.T) {
 	if updateReq.Statement.Value != storage.NewStringValue("Ada") {
 		t.Fatalf("unexpected update value: %+v", updateReq.Statement.Value)
 	}
+	if updateReq.Statement.Where != nil {
+		t.Fatalf("expected nil WHERE expression, got %T", updateReq.Statement.Where)
+	}
 }
 
-func TestBuildRequestUpdateRejectsWhere(t *testing.T) {
+func TestBuildRequestUpdateAcceptsWhere(t *testing.T) {
 	raw, err := Parse("update students set name = 'Ada' where id = 1")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = BuildRequest(raw)
-	if err == nil {
-		t.Fatal("expected invalid-definition error, got nil")
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, shared.ErrInvalidDefinition) {
-		t.Fatalf("expected invalid-definition error, got %v", err)
+
+	updateReq := req.(UpdateRequest)
+	whereExpr, ok := updateReq.Statement.Where.(statement.ComparisonExpr)
+	if !ok {
+		t.Fatalf("expected comparison WHERE expression, got %T", updateReq.Statement.Where)
+	}
+	if whereExpr.Operator != statement.OpEqual {
+		t.Fatalf("expected = WHERE operator, got %q", whereExpr.Operator)
+	}
+}
+
+func TestBuildRequestDeleteAcceptsLogicalWhereChain(t *testing.T) {
+	raw, err := Parse("delete from students where id = 1 and dept_id = 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleteReq := req.(DeleteRequest)
+	logicalExpr, ok := deleteReq.Statement.Where.(statement.LogicalExpr)
+	if !ok {
+		t.Fatalf("expected logical WHERE expression, got %T", deleteReq.Statement.Where)
+	}
+	if logicalExpr.Operator != statement.OpAnd {
+		t.Fatalf("expected AND logical operator, got %q", logicalExpr.Operator)
+	}
+	if len(logicalExpr.Terms) != 2 {
+		t.Fatalf("expected 2 logical terms, got %d", len(logicalExpr.Terms))
+	}
+}
+
+func TestBuildRequestUpdateAcceptsLogicalWhereChain(t *testing.T) {
+	raw, err := Parse("update students set name = 'Ada' where id = 1 or dept_id = 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := BuildRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updateReq := req.(UpdateRequest)
+	logicalExpr, ok := updateReq.Statement.Where.(statement.LogicalExpr)
+	if !ok {
+		t.Fatalf("expected logical WHERE expression, got %T", updateReq.Statement.Where)
+	}
+	if logicalExpr.Operator != statement.OpOr {
+		t.Fatalf("expected OR logical operator, got %q", logicalExpr.Operator)
+	}
+	if len(logicalExpr.Terms) != 2 {
+		t.Fatalf("expected 2 logical terms, got %d", len(logicalExpr.Terms))
 	}
 }
 

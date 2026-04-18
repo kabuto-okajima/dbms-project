@@ -16,6 +16,8 @@ type UpdateStatement struct {
 	TableName  string
 	ColumnName string
 	Value      storage.Value
+	Where      Expression
+	Matcher    RowPredicate
 }
 
 // UpdateExecutor will rewrite rows and maintain constraints/indexes.
@@ -33,7 +35,7 @@ func NewUpdateExecutor(manager *catalog.Manager) *UpdateExecutor {
 	return &UpdateExecutor{Catalog: manager}
 }
 
-// Execute rewrites all rows in the target table for one-column assignment.
+// Execute rewrites all matching rows in the target table for one-column assignment.
 func (e *UpdateExecutor) Execute(tx *storage.Tx, stmt UpdateStatement) (Result, error) {
 	if e.Catalog == nil {
 		e.Catalog = catalog.NewManager()
@@ -59,6 +61,15 @@ func (e *UpdateExecutor) Execute(tx *storage.Tx, stmt UpdateStatement) (Result, 
 		row, err := storage.DecodeRow(payload)
 		if err != nil {
 			return err
+		}
+		if stmt.Matcher != nil {
+			match, err := stmt.Matcher(row)
+			if err != nil {
+				return err
+			}
+			if !match {
+				return nil
+			}
 		}
 
 		if columnOrdinal >= len(row) {
