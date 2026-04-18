@@ -57,6 +57,20 @@ func EncodeIndexKey(value Value) ([]byte, error) {
 	return json.Marshal(value)
 }
 
+// DecodeIndexKey turns a stored index key back into one typed cell value.
+func DecodeIndexKey(data []byte) (Value, error) {
+	if len(data) == 0 {
+		return Value{}, nil
+	}
+
+	var value Value
+	if err := json.Unmarshal(data, &value); err != nil {
+		return Value{}, err
+	}
+
+	return value, nil
+}
+
 // EncodeRIDList turns an RID list into bytes for index bucket storage.
 func EncodeRIDList(rids []RID) ([]byte, error) {
 	return json.Marshal(rids)
