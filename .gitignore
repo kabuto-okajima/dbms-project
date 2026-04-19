@@ -19,5 +19,6 @@ coverage.out
 .gocache/
 
 docs/original_memo.md
-
+docs/demo.md
+load_relations.sh
 *.db

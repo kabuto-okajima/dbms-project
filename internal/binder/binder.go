@@ -98,10 +98,11 @@ func (BoundStarExpr) isBoundExpression() {}
 
 // BoundColumnRef identifies a column after catalog resolution.
 type BoundColumnRef struct {
-	TableName  string
-	ColumnName string
-	Ordinal    int
-	Type       shared.DataType
+	BindingName string // e.g., "users" or "u" if the table is aliased as "u"
+	TableName   string
+	ColumnName  string
+	Ordinal     int
+	Type        shared.DataType
 }
 
 func (BoundColumnRef) isBoundExpression() {}
@@ -267,16 +268,11 @@ func (b *Binder) bindTables(tx *storage.Tx, refs []statement.TableRef) ([]BoundT
 			return nil, err
 		}
 
-		lookupNames := []string{tableRef.Name}
-		if tableRef.Alias != "" {
-			lookupNames = append(lookupNames, tableRef.Alias)
+		visibleName := tableBindingName(tableRef.Name, tableRef.Alias)
+		if _, exists := seenNames[visibleName]; exists {
+			return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: duplicate table name or alias %q", visibleName)
 		}
-		for _, name := range lookupNames {
-			if _, exists := seenNames[name]; exists {
-				return nil, shared.NewError(shared.ErrInvalidDefinition, "bind select: duplicate table name or alias %q", name)
-			}
-			seenNames[name] = struct{}{}
-		}
+		seenNames[visibleName] = struct{}{}
 
 		boundTables = append(boundTables, BoundTable{
 			Name:     tableRef.Name,
@@ -286,6 +282,13 @@ func (b *Binder) bindTables(tx *storage.Tx, refs []statement.TableRef) ([]BoundT
 	}
 
 	return boundTables, nil
+}
+
+func tableBindingName(baseName, alias string) string {
+	if alias != "" {
+		return alias
+	}
+	return baseName
 }
 
 func validateFromClauseShape(stmt statement.SelectStatement) error {
@@ -462,7 +465,7 @@ func bindUnqualifiedColumnRef(tables []BoundTable, columnName string) (BoundExpr
 
 func findBoundTableByName(tables []BoundTable, name string) (int, BoundTable, bool) {
 	for tableIndex, table := range tables {
-		if name == table.Name || name == table.Alias {
+		if name == tableBindingName(table.Name, table.Alias) {
 			return tableIndex, table, true
 		}
 	}
@@ -487,10 +490,11 @@ func bindColumnRefFromTable(tables []BoundTable, tableIndex int, table BoundTabl
 	}
 
 	return BoundColumnRef{
-		TableName:  table.Name,
-		ColumnName: column.Name,
-		Ordinal:    globalColumnOrdinal(tables, tableIndex, ordinal),
-		Type:       column.Type,
+		BindingName: tableBindingName(table.Name, table.Alias),
+		TableName:   table.Name,
+		ColumnName:  column.Name,
+		Ordinal:     globalColumnOrdinal(tables, tableIndex, ordinal),
+		Type:        column.Type,
 	}, nil
 }
 
@@ -587,7 +591,7 @@ func validateJoinClause(join *BoundJoinClause) error {
 	if !ok {
 		return shared.NewError(shared.ErrInvalidDefinition, "bind select: right JOIN key must be a column reference")
 	}
-	if leftColumn.TableName == rightColumn.TableName {
+	if leftColumn.BindingName == rightColumn.BindingName {
 		return shared.NewError(shared.ErrInvalidDefinition, "bind select: JOIN keys must come from different tables")
 	}
 

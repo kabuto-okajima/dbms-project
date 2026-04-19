@@ -325,6 +325,125 @@ func TestBindSelectResolvesTwoTableJoinColumns(t *testing.T) {
 	}
 }
 
+func TestBindSelectSupportsAliasBasedSelfJoin(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		return manager.CreateTable(tx, shared.TableDefinition{
+			Name: "t",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+				{Name: "b", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		bound, err := New(manager).BindSelect(tx, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{TableName: "r", ColumnName: "id"}},
+				{Expr: statement.ColumnRef{TableName: "s", ColumnName: "id"}},
+			},
+			From: []statement.TableRef{
+				{Name: "t", Alias: "r"},
+				{Name: "t", Alias: "s"},
+			},
+			Join: &statement.JoinClause{
+				Type: statement.JoinInner,
+				On: statement.ComparisonExpr{
+					Left:     statement.ColumnRef{TableName: "r", ColumnName: "b"},
+					Operator: statement.OpEqual,
+					Right:    statement.ColumnRef{TableName: "s", ColumnName: "b"},
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(bound.From) != 2 || bound.Join == nil {
+			t.Fatalf("unexpected bound self-join shape: %+v", bound)
+		}
+
+		left := bound.SelectItems[0].Expr.(BoundColumnRef)
+		right := bound.SelectItems[1].Expr.(BoundColumnRef)
+		if left.Ordinal != 0 || right.Ordinal != 2 {
+			t.Fatalf("unexpected self-join select ordinals: left=%+v right=%+v", left, right)
+		}
+
+		onExpr, ok := bound.Join.On.(BoundComparisonExpr)
+		if !ok {
+			t.Fatalf("expected bound ON comparison, got %T", bound.Join.On)
+		}
+		leftOn := onExpr.Left.(BoundColumnRef)
+		rightOn := onExpr.Right.(BoundColumnRef)
+		if leftOn.Ordinal != 1 || rightOn.Ordinal != 3 {
+			t.Fatalf("unexpected self-join ON ordinals: left=%+v right=%+v", leftOn, rightOn)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindSelectAliasHidesBaseTableName(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := catalog.NewManager()
+	err = store.Update(func(tx *storage.Tx) error {
+		return manager.CreateTable(tx, shared.TableDefinition{
+			Name: "students",
+			Columns: []shared.ColumnDefinition{
+				{Name: "id", Type: shared.TypeInteger},
+			},
+			PrimaryKey: []string{"id"},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.View(func(tx *storage.Tx) error {
+		_, err := New(manager).BindSelect(tx, statement.SelectStatement{
+			SelectItems: []statement.SelectItem{
+				{Expr: statement.ColumnRef{TableName: "students", ColumnName: "id"}},
+			},
+			From: []statement.TableRef{
+				{Name: "students", Alias: "s"},
+			},
+		})
+		if err == nil {
+			t.Fatal("expected base-table qualifier to be hidden by alias, got nil")
+		}
+		if !errors.Is(err, shared.ErrNotFound) {
+			t.Fatalf("expected not-found error, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBindSelectRejectsTypeMismatch(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 
