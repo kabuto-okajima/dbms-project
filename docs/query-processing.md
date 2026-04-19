@@ -36,7 +36,6 @@ Main rewrites:
 What is not implemented:
 - no cost-based optimization
 - no dynamic join algorithm selection
-- no hash join
 - no sort-merge join
 
 ## Execution Model
@@ -53,7 +52,7 @@ Implemented operators:
 - **Index Scan**: reads rows through a single-column index
 - **Selection**: filters rows using a Boolean predicate
 - **Projection**: keeps only needed columns
-- **Join**: combines rows from two inputs using a nested-loop equi-join
+- **Join**: combines rows from two inputs using a hash equi-join for the currently supported inner join shape, with nested loop join kept as a fallback operator
 - **Sort**: orders rows for `ORDER BY`
 - **Aggregate / Group By**: groups rows and computes aggregate values
 - **HAVING**: filters grouped results

@@ -59,7 +59,7 @@ Handles tuple-level statements such as insert, delete, update, and select. It ap
 Applies simple rule-based rewrites. It improves the logical plan without using a cost-based model.
 
 ### Execution Engine
-Runs the physical plan and returns rows or status output. Execution time is measured for the full top-level statement.
+Runs the physical plan and returns rows or status output. Execution time is measured for the full top-level statement. For the currently supported two-table inner equi-join shape, the executor lowers to a hash join, while nested loop join remains available as a fallback physical operator for future expansion.
 
 ### Storage Structures
 Stores catalog data, table rows, and index data in one persistent database file.

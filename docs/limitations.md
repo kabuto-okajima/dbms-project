@@ -29,10 +29,9 @@ The memo mentions these as possible later additions:
 
 ## Optimizer and Execution Limits
 - no cost-based optimizer
-- no hash join
 - no sort-merge join
 - no dynamic join algorithm selection
-- join implementation is fixed nested-loop equi-join
+- nested loop join remains in the executor as a fallback path
 
 ## Input / UI Limits
 - interactive CLI is the main input mode

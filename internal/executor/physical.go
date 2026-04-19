@@ -44,9 +44,6 @@ type PhysicalFilter struct {
 func (PhysicalFilter) isPhysicalPlan() {}
 
 // PhysicalNestedLoopJoin combines two inputs using one join predicate.
-//
-// The executor does not run this node yet; this step only establishes the
-// physical-plan shape that will be executed in the next step.
 type PhysicalNestedLoopJoin struct {
 	Left      PhysicalPlan
 	Right     PhysicalPlan
@@ -54,6 +51,17 @@ type PhysicalNestedLoopJoin struct {
 }
 
 func (PhysicalNestedLoopJoin) isPhysicalPlan() {}
+
+// PhysicalHashJoin combines two inputs using one equi-join key from each side.
+type PhysicalHashJoin struct {
+	Left      PhysicalPlan
+	Right     PhysicalPlan
+	LeftKey   binder.BoundColumnRef
+	RightKey  binder.BoundColumnRef
+	Predicate binder.BoundExpression
+}
+
+func (PhysicalHashJoin) isPhysicalPlan() {}
 
 // PhysicalAggregate groups rows and computes aggregate values.
 type PhysicalAggregate struct {

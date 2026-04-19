@@ -95,7 +95,7 @@ func TestBuildPhysicalPlanChoosesIndexScanForIndexedPredicate(t *testing.T) {
 	}
 }
 
-func TestBuildPhysicalPlanLowersLogicalJoinToNestedLoopJoin(t *testing.T) {
+func TestBuildPhysicalPlanLowersLogicalJoinToHashJoin(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 
 	store, err := storage.Open(dbPath)
@@ -176,12 +176,15 @@ func TestBuildPhysicalPlanLowersLogicalJoinToNestedLoopJoin(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected project input to be filter, got %T", project.Input)
 		}
-		join, ok := filter.Input.(PhysicalNestedLoopJoin)
+		join, ok := filter.Input.(PhysicalHashJoin)
 		if !ok {
-			t.Fatalf("expected filter input to be nested-loop join, got %T", filter.Input)
+			t.Fatalf("expected filter input to be hash join, got %T", filter.Input)
 		}
 		if join.Predicate == nil {
 			t.Fatal("expected join predicate to be populated")
+		}
+		if join.LeftKey.ColumnName != "dept_id" || join.RightKey.ColumnName != "id" {
+			t.Fatalf("unexpected hash join keys: left=%+v right=%+v", join.LeftKey, join.RightKey)
 		}
 
 		leftScan, ok := join.Left.(PhysicalTableScan)
@@ -200,6 +203,66 @@ func TestBuildPhysicalPlanLowersLogicalJoinToNestedLoopJoin(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBuildPhysicalPlanFallsBackToNestedLoopJoinWhenJoinPredicateIsNotHashJoinable(t *testing.T) {
+	logical := planner.LogicalJoin{
+		Left: planner.LogicalScan{
+			Table: binder.BoundTable{
+				Name: "students",
+				Metadata: &catalog.TableMetadata{
+					Name: "students",
+					Columns: []shared.ColumnDefinition{
+						{Name: "id", Type: shared.TypeInteger},
+					},
+				},
+			},
+		},
+		Right: planner.LogicalScan{
+			Table: binder.BoundTable{
+				Name: "departments",
+				Metadata: &catalog.TableMetadata{
+					Name: "departments",
+					Columns: []shared.ColumnDefinition{
+						{Name: "id", Type: shared.TypeInteger},
+					},
+				},
+			},
+		},
+		Predicate: binder.BoundLogicalExpr{
+			Operator: statement.OpAnd,
+			Terms: []binder.BoundExpression{
+				binder.BoundComparisonExpr{
+					Left: binder.BoundColumnRef{
+						TableName:  "students",
+						ColumnName: "id",
+						Ordinal:    0,
+						Type:       shared.TypeInteger,
+					},
+					Operator: statement.OpEqual,
+					Right: binder.BoundColumnRef{
+						TableName:  "departments",
+						ColumnName: "id",
+						Ordinal:    1,
+						Type:       shared.TypeInteger,
+					},
+				},
+			},
+		},
+	}
+
+	physical, err := BuildPhysicalPlan(&storage.Tx{}, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	join, ok := physical.(PhysicalNestedLoopJoin)
+	if !ok {
+		t.Fatalf("expected nested-loop fallback, got %T", physical)
+	}
+	if join.Predicate == nil {
+		t.Fatal("expected nested-loop fallback to retain predicate")
 	}
 }
 

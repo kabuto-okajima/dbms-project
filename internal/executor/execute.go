@@ -82,6 +82,8 @@ func executePhysicalPlan(tx *storage.Tx, plan PhysicalPlan) (RuntimeResult, erro
 		return node.Execute(tx)
 	case PhysicalIndexScan:
 		return node.Execute(tx)
+	case PhysicalHashJoin:
+		return node.Execute(tx)
 	case PhysicalNestedLoopJoin:
 		return node.Execute(tx)
 	case PhysicalFilter:
@@ -400,31 +402,14 @@ func (join PhysicalNestedLoopJoin) Execute(tx *storage.Tx) (RuntimeResult, error
 		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: join predicate is required")
 	}
 
-	// join.Left: LogicalScan{Table: t},
-	// join.Right: LogicalScan{Table: u}
-	left, err := executePhysicalPlan(tx, join.Left)
+	left, right, result, err := executeJoinInputs(tx, join.Left, join.Right)
 	if err != nil {
 		return RuntimeResult{}, err
 	}
-	right, err := executePhysicalPlan(tx, join.Right)
-	if err != nil {
-		return RuntimeResult{}, err
-	}
-
-	result := RuntimeResult{
-		Schema: make(RuntimeSchema, 0, len(left.Schema)+len(right.Schema)),
-		Rows:   make([]RuntimeRow, 0),
-	}
-	result.Schema = append(result.Schema, left.Schema...)
-	result.Schema = append(result.Schema, right.Schema...)
 
 	for _, leftRow := range left.Rows {
 		for _, rightRow := range right.Rows {
-			joinedValues := make(storage.Row, 0, len(leftRow.Values)+len(rightRow.Values))
-			joinedValues = append(joinedValues, leftRow.Values...)
-			joinedValues = append(joinedValues, rightRow.Values...)
-
-			joinedRow := RuntimeRow{Values: joinedValues}
+			joinedRow := joinRows(leftRow, rightRow)
 			ok, err := EvaluatePredicate(join.Predicate, joinedRow)
 			if err != nil {
 				return RuntimeResult{}, err
@@ -434,6 +419,68 @@ func (join PhysicalNestedLoopJoin) Execute(tx *storage.Tx) (RuntimeResult, error
 			}
 
 			result.Rows = append(result.Rows, joinedRow)
+		}
+	}
+
+	return result, nil
+}
+
+// Execute materializes both inputs and performs a hash equi-join.
+func (join PhysicalHashJoin) Execute(tx *storage.Tx) (RuntimeResult, error) {
+	if tx == nil {
+		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: transaction is required")
+	}
+	if join.Predicate == nil {
+		return RuntimeResult{}, shared.NewError(shared.ErrInvalidDefinition, "executor: join predicate is required")
+	}
+
+	// fmt.Printf("join: %+v\n", join)
+
+	left, right, result, err := executeJoinInputs(tx, join.Left, join.Right)
+
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+	// fmt.Printf("result: %+v\n", result)
+	// fmt.Printf("left table content: %+v\n", left)
+
+	leftKeyOrdinal, rightKeyOrdinal, err := localHashJoinKeyOrdinals(join, len(left.Schema), len(right.Schema))
+	if err != nil {
+		return RuntimeResult{}, err
+	}
+
+	// Build a hash table from the right input so each left row can probe matching keys directly.
+	rightBuckets := make(map[storage.Value][]RuntimeRow, len(right.Rows))
+	for _, rightRow := range right.Rows {
+		key, err := rightRow.valueAt(rightKeyOrdinal)
+		if err != nil {
+			return RuntimeResult{}, err
+		}
+		rightBuckets[key] = append(rightBuckets[key], rightRow)
+	}
+
+	// rightRows:
+	// [101, 1]
+	// [102, 1]
+	// [103, 2]
+	// hash table:
+	// 1 -> [[101, 1], [102, 1]]
+	// 2 -> [[103, 2]]
+	// rightBuckets is like:
+	// {1: [[101, 1], [102, 1]], 2: [[103, 2]]}
+
+	for _, leftRow := range left.Rows {
+		key, err := leftRow.valueAt(leftKeyOrdinal)
+		if err != nil {
+			return RuntimeResult{}, err
+		}
+
+		// If the left key value does not exist in the hash table,
+		// there are no matches (matches == nil) for this left row and we can skip it.
+		// note: Go map internally uses a hash table, so the lookup rightBuckets[key] is efficient even if rightBuckets has many entries.
+		matches := rightBuckets[key]
+		for _, rightRow := range matches {
+			result.Rows = append(result.Rows, joinRows(leftRow, rightRow))
 		}
 	}
 
@@ -472,6 +519,61 @@ func (filter PhysicalFilter) Execute(tx *storage.Tx) (RuntimeResult, error) {
 	}
 
 	return result, nil
+}
+
+func executeJoinInputs(tx *storage.Tx, leftPlan PhysicalPlan, rightPlan PhysicalPlan) (RuntimeResult, RuntimeResult, RuntimeResult, error) {
+	left, err := executePhysicalPlan(tx, leftPlan)
+	if err != nil {
+		return RuntimeResult{}, RuntimeResult{}, RuntimeResult{}, err
+	}
+
+	right, err := executePhysicalPlan(tx, rightPlan)
+	if err != nil {
+		return RuntimeResult{}, RuntimeResult{}, RuntimeResult{}, err
+	}
+
+	return left, right, newJoinResult(left.Schema, right.Schema), nil
+}
+
+func newJoinResult(leftSchema RuntimeSchema, rightSchema RuntimeSchema) RuntimeResult {
+	result := RuntimeResult{
+		Schema: make(RuntimeSchema, 0, len(leftSchema)+len(rightSchema)),
+		Rows:   make([]RuntimeRow, 0),
+	}
+	result.Schema = append(result.Schema, leftSchema...)
+	result.Schema = append(result.Schema, rightSchema...)
+	return result
+}
+
+func joinRows(leftRow RuntimeRow, rightRow RuntimeRow) RuntimeRow {
+	joinedValues := make(storage.Row, 0, len(leftRow.Values)+len(rightRow.Values))
+	joinedValues = append(joinedValues, leftRow.Values...)
+	joinedValues = append(joinedValues, rightRow.Values...)
+	return RuntimeRow{Values: joinedValues}
+}
+
+func localHashJoinKeyOrdinals(join PhysicalHashJoin, leftWidth int, rightWidth int) (int, int, error) {
+	leftOrdinal := join.LeftKey.Ordinal
+	if leftOrdinal < 0 || leftOrdinal >= leftWidth {
+		return 0, 0, shared.NewError(
+			shared.ErrInvalidDefinition,
+			"executor: left hash join key ordinal %d is out of range for width %d",
+			leftOrdinal,
+			leftWidth,
+		)
+	}
+
+	rightOrdinal := join.RightKey.Ordinal - leftWidth
+	if rightOrdinal < 0 || rightOrdinal >= rightWidth {
+		return 0, 0, shared.NewError(
+			shared.ErrInvalidDefinition,
+			"executor: right hash join key ordinal %d is out of range for width %d",
+			join.RightKey.Ordinal,
+			leftWidth+rightWidth,
+		)
+	}
+
+	return leftOrdinal, rightOrdinal, nil
 }
 
 // matchingIndexRIDs returns the list of row IDs that match the index scan condition.

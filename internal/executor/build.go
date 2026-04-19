@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"dbms-project/internal/binder"
 	"dbms-project/internal/planner"
 	"dbms-project/internal/shared"
 	"dbms-project/internal/storage"
@@ -36,6 +37,11 @@ func buildPhysicalPlan(tx *storage.Tx, plan planner.LogicalPlan) (PhysicalPlan, 
 		right, err := buildPhysicalPlan(tx, node.Right)
 		if err != nil {
 			return nil, err
+		}
+		// If the join predicate is an equality between two columns of hashable types, we can use a hash join.
+		hashJoin, ok := tryBuildHashJoin(node, left, right)
+		if ok {
+			return hashJoin, nil
 		}
 		return PhysicalNestedLoopJoin{
 			Left:      left,
@@ -111,5 +117,42 @@ func buildPhysicalPlan(tx *storage.Tx, plan planner.LogicalPlan) (PhysicalPlan, 
 		}, nil
 	default:
 		return nil, shared.NewError(shared.ErrInvalidDefinition, "executor: unsupported logical plan %T", plan)
+	}
+}
+
+func tryBuildHashJoin(node planner.LogicalJoin, left PhysicalPlan, right PhysicalPlan) (PhysicalHashJoin, bool) {
+	comparison, ok := node.Predicate.(binder.BoundComparisonExpr)
+	if !ok {
+		return PhysicalHashJoin{}, false
+	}
+
+	leftKey, ok := comparison.Left.(binder.BoundColumnRef)
+	if !ok {
+		return PhysicalHashJoin{}, false
+	}
+	rightKey, ok := comparison.Right.(binder.BoundColumnRef)
+	if !ok {
+		return PhysicalHashJoin{}, false
+	}
+
+	if !isHashJoinKeyType(leftKey.Type) || !isHashJoinKeyType(rightKey.Type) {
+		return PhysicalHashJoin{}, false
+	}
+
+	return PhysicalHashJoin{
+		Left:      left,
+		Right:     right,
+		LeftKey:   leftKey,
+		RightKey:  rightKey,
+		Predicate: node.Predicate,
+	}, true
+}
+
+func isHashJoinKeyType(dataType shared.DataType) bool {
+	switch dataType {
+	case shared.TypeInteger, shared.TypeString:
+		return true
+	default:
+		return false
 	}
 }
