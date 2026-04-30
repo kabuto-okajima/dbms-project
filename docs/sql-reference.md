@@ -1,27 +1,28 @@
-# Statements
+# SQL Reference
 
 ## Supported Statements
-### DDL
+DDL:
 - `CREATE TABLE`
 - `DROP TABLE`
 - `CREATE INDEX`
 - `DROP INDEX`
 
-### DML
+DML:
 - `INSERT`
 - `DELETE`
 - `UPDATE`
 - `SELECT`
 
-## General Rules
-- each SQL statement is all-or-nothing
-- if validation, constraint checks, row updates, catalog updates, or index updates fail, the statement fails
-- a parsed statement may still be rejected later as unsupported
-- execution time is measured for the full top-level statement
-
 ## CREATE TABLE
+Supported constraint shapes:
+- inline single-column primary key
+- table-level single-column primary key
+- inline single-column `REFERENCES`
+- table-level single-column `FOREIGN KEY`
+- default FK actions or explicit `RESTRICT`
+
 Flow:
-1. parse and bind table definition
+1. parse table definition
 2. validate names, types, PK/FK shape, and referenced table/column existence
 3. reject unsupported definitions
 4. write catalog metadata
@@ -41,6 +42,10 @@ Flow:
 If FK restriction fails, nothing is removed.
 
 ## CREATE INDEX
+Supported index shapes:
+- single-column secondary index
+- single-column unique secondary index
+
 Flow:
 1. validate table and column
 2. validate index definition
@@ -50,6 +55,8 @@ Flow:
 6. return success
 
 If build fails, the index is not kept.
+
+Unique secondary indexes reject duplicate keys while building from existing rows, on `INSERT`, and on `UPDATE`.
 
 ## DROP INDEX
 Flow:
@@ -61,6 +68,13 @@ Flow:
 If removal fails, the index remains unchanged.
 
 ## INSERT
+Current shape:
+- one `VALUES` row per statement
+- integer and string literal values only
+- optional explicit column list is supported
+- explicit column lists may reorder values into schema order
+- partial, duplicate-column, and unknown-column inserts are rejected
+
 Flow:
 1. validate target table and input values
 2. check type compatibility
@@ -85,6 +99,11 @@ If any step fails, nothing is deleted.
 `DELETE` without `WHERE` is allowed.
 
 ## UPDATE
+Current shape:
+- one target table
+- one column assignment per statement
+- integer and string literal assignment values only
+
 Flow:
 1. identify rows matching the predicate
 2. compute new row values
@@ -101,6 +120,13 @@ If any step fails, old rows remain unchanged.
 `UPDATE` without `WHERE` is allowed.
 
 ## SELECT
+Supported select-list shapes:
+- `*`
+- column references
+- integer and string literals
+- supported aggregate expressions
+- aliases for output columns
+
 Flow:
 1. validate tables, columns, predicates, grouping, aggregates, and aliases
 2. reject unsupported queries
@@ -110,7 +136,9 @@ Flow:
 6. execute query tree
 7. format rows and return timing
 
-`SELECT *` is supported.
+Table aliases are supported. When a table has an alias, the alias is the visible qualifier. This also allows alias-based self-joins.
+
+`SELECT *` is supported through the `*` select-list shape.
 
 ## Constraint Rules
 - duplicate tuples are allowed unless a PK is violated
@@ -119,11 +147,3 @@ Flow:
 - parent delete/update uses `RESTRICT`
 - no cascade behavior in v1
 - index maintenance happens on insert, delete, and update
-
-## Transaction Boundary
-- each top-level statement runs in one `bbolt` transaction
-- `SELECT` uses a read-only transaction
-- DDL and write DML use a write transaction
-- catalog updates, row updates, RID allocation, constraint checks, and index updates happen in the same statement transaction
-- a statement becomes visible only after commit
-- if any step fails, the whole statement is rolled back

@@ -1,5 +1,7 @@
-## repository structure
-```
+# Development
+
+## Repository Structure
+```text
 dbms-project/
 ├── README.md
 ├── main.go
@@ -26,17 +28,16 @@ dbms-project/
 │   │   ├── rid.go
 │   │   └── row_codec.go
 │   │
-│   ├── index/
-│   │   └── index.go
-│   │
 │   ├── planner/
+│   │   ├── build.go
 │   │   ├── logical.go
-│   │   ├── optimizer.go
-│   │   └── physical.go
+│   │   └── optimizer.go
 │   │
 │   ├── executor/
-│   │   ├── executor.go
-│   │   └── operators.go
+│   │   ├── build.go
+│   │   ├── execute.go
+│   │   ├── index_selection.go
+│   │   └── physical.go
 │   │
 │   ├── statement/
 │   │   ├── create_table.go
@@ -56,8 +57,15 @@ dbms-project/
 │       └── errors.go
 │
 └── docs/
+    ├── cli-and-output.md
+    ├── development.md
+    ├── errors-and-transactions.md
+    ├── limitations.md
+    ├── overview.md
+    ├── query-engine.md
+    ├── sql-reference.md
+    └── storage-catalog-indexes.md
 ```
-
 
 ## app/
 Controls the overall flow of the program.
@@ -83,17 +91,14 @@ This includes information about tables, columns, primary keys, foreign keys, and
 Handles low-level data storage.
 It is responsible for bbolt access, row encoding, and RID management.
 
-## index/
-Handles index-related logic.
-It builds indexes, updates them when data changes, and uses them during query processing.
-
 ## planner/
 Builds the query plan.
-It creates the logical plan, applies simple optimization rules, and turns the result into a physical execution plan.
+It creates the logical plan and applies simple optimization rules.
 
 ## executor/
-Runs the physical plan.
-It performs the actual query operations such as scan, filter, join, sort, and aggregate.
+Builds and runs the physical plan.
+It performs the actual query operations such as scan, index scan, filter, join, sort, and aggregate.
+Index metadata lives in the catalog, index maintenance lives with write statements, and index selection lives in the executor.
 
 ## statement/
 Implements each SQL statement.

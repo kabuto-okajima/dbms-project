@@ -6,9 +6,11 @@
 - two-table **equi-join only** in v1
 - conjunction-only or disjunction-only predicates in v1
 - `GROUP BY` on one column only
-- `ORDER BY` on one column only
+- `ORDER BY` supports one or more scalar sort keys
 - only `integer` and `string` data types
 - only `COUNT(*)`, `SUM`, `MIN`, and `MAX`
+- `INSERT` supports one `VALUES` row per statement
+- `UPDATE` supports one column assignment per statement
 
 The memo mentions these as possible later additions:
 - theta-join
@@ -32,6 +34,7 @@ The memo mentions these as possible later additions:
 - no sort-merge join
 - no dynamic join algorithm selection
 - nested loop join remains in the executor as a fallback path
+- projection pushdown is not implemented yet
 
 ## Input / UI Limits
 - interactive CLI is the main input mode

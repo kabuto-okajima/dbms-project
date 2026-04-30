@@ -1,4 +1,4 @@
-# Storage and Catalog
+# Storage, Catalog, and Indexes
 
 ## Storage Choice
 The system uses the `bbolt` library as the storage layer.
@@ -29,7 +29,6 @@ Example bucket names:
 - `catalog/INDEXES`
 - `table/Students`
 - `index/idx_students_age`
-- `index/pk_students_id`
 
 ## Row Storage
 Each row has a stable RID.
@@ -45,7 +44,7 @@ Example:
 - `RID=2 -> [2, "Bob", 21, 10]`
 
 ## Index Model
-Only single-column indexes are supported in the baseline memo.
+Only single-column indexes are supported.
 
 Each index maps:
 - `key -> list of RIDs`
@@ -54,11 +53,12 @@ Example:
 - `20 -> [RID 1, RID 5, RID 9]`
 - `21 -> [RID 2, RID 8]`
 
-For unique indexes, the RID list always has one value.
+For unique secondary indexes, the RID list always has one value.
 
 ## Index Rules
 - normal indexes allow duplicate keys
-- primary-key-backed indexes are unique
+- unique secondary indexes reject duplicate keys
+- primary keys are unique, but the current implementation does not create an automatic primary-key-backed index bucket
 - `INSERT` adds the RID under the new key
 - `DELETE` removes the RID from the key
 - `UPDATE` removes the old RID entry and adds the new one
@@ -81,6 +81,8 @@ Index scan is used only for simple predicates on one indexed column:
 - `<=`
 
 `!=` may still fall back to table scan.
+
+For `AND` predicates, the executor can use one eligible indexed comparison and evaluate the remaining terms as a residual predicate after loading candidate rows.
 
 ## NULL Handling
 `NULL` is not supported in v1.
